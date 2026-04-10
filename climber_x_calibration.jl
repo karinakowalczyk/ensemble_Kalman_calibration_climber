@@ -905,6 +905,8 @@ function run_climber_x_calibration(;
         pdf_obs = compute_pdf_on_grid(amoc_default, pdf_grid, remove_spinup=false)
         
         # Compute dynamical statistics from default run
+        # Default run always uses the original LOESS + peak-walkback detection
+        # (do_method="loess", crossing_value=5.0) regardless of ensemble settings.
         stats_default = compute_summary_stats(amoc_default;
                                              time_data=time_default,
                                              remove_spinup=false,
@@ -912,9 +914,9 @@ function run_climber_x_calibration(;
                                              adaptive_threshold=true,
                                              threshold_method="clustering",
                                              loess_span=0.02,
-                                             do_min_spacing=600,
-                                             do_crossing_value=do_crossing_value,
-                                             do_method=do_method)
+                                             do_min_spacing=500,
+                                             do_crossing_value=5.0,
+                                             do_method="loess")
         
         # Create raw observation vector
         y_obs_raw = vcat(
@@ -1272,7 +1274,7 @@ function run_climber_x_calibration(;
                 push!(final_waiting_times, calibration_vector[n_pdf+1])
                 push!(final_stadial_durations, calibration_vector[n_pdf+2])
             catch e
-                @warn "Could not process final member $j"
+                @warn "Could not process final member $j: $e"
             end
         end
     end
