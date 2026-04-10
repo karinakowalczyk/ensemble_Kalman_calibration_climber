@@ -98,6 +98,25 @@ function find_crossing_before_peak(residual, time, peak_idx, crossing_value)
 end
 
 """
+Detect DO onsets as upward crossings of `cv` in a pre-computed LOESS residual,
+with a minimum inter-event spacing filter.
+Returns (onset_indices, onset_times, avg_waiting_time).
+"""
+function detect_do_upward_crossing(resid, time; cv=-0.8, min_spacing=500.0)
+    all_cross = [i for i in 2:length(resid)
+                 if resid[i-1] < cv && resid[i] >= cv]
+    onsets = Int[]
+    for i in all_cross
+        if isempty(onsets) || time[i] - time[onsets[end]] >= min_spacing
+            push!(onsets, i)
+        end
+    end
+    do_times = isempty(onsets) ? Float64[] : time[onsets]
+    avg_wt   = length(do_times) > 1 ? mean(diff(do_times)) : NaN
+    return onsets, do_times, avg_wt
+end
+
+"""
 Detect DO events using LOESS detrending and peak detection
 """
 function detect_do_events_simple(amoc, time; span=0.02, min_spacing=500, crossing_value=5.0)
@@ -141,11 +160,14 @@ end
 Compute comprehensive summary statistics from AMOC timeseries
 Returns: Dictionary with PDF, stadial info, DO events, etc.
 """
-function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true, 
+function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
                                spinup_fraction=0.02, adaptive_threshold=true,
-                               threshold_method="clustering", threshold=nothing, 
+                               threshold_method="clustering", threshold=nothing,
                                grid_points=100, ignore_first_stadial=true,
-                               loess_span=0.02, do_min_spacing=500, do_crossing_value=5.0)
+                               loess_span=0.02, do_min_spacing=500, do_crossing_value=5.0,
+                               do_method="loess")
+    # do_method: "loess"       — original LOESS detrend + peak detection (default)
+    #            "stadial_end" — use stadial→interstadial threshold crossings directly
     amoc_data = vec(amoc_data)
     if isnothing(time_data)
         time_data = collect(0:length(amoc_data)-1)
@@ -210,13 +232,27 @@ function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
     end
     
     # Detect DO events
-    do_event_indices, do_times, do_waiting_times = detect_do_events_simple(
-        amoc_data, time_data; 
-        span=loess_span, 
-        min_spacing=do_min_spacing, 
-        crossing_value=do_crossing_value
-    )
-    
+    if do_method == "stadial_end"
+        # Each stadial→interstadial crossing is a DO event onset
+        do_event_indices = copy(stadial_ends)
+        do_times         = length(stadial_ends) > 0 ? time_data[stadial_ends] : Float64[]
+        do_waiting_times = length(do_times) > 1 ? diff(do_times) : Float64[]
+    elseif do_method == "upward_crossing"
+        # LOESS residual upward-crossing at do_crossing_value
+        model_uc = loess(time_data, amoc_data, span=loess_span)
+        resid_uc = amoc_data .- predict(model_uc, time_data)
+        do_event_indices, do_times, _ = detect_do_upward_crossing(
+            resid_uc, time_data; cv=do_crossing_value, min_spacing=Float64(do_min_spacing))
+        do_waiting_times = length(do_times) > 1 ? diff(do_times) : Float64[]
+    else
+        do_event_indices, do_times, do_waiting_times = detect_do_events_simple(
+            amoc_data, time_data;
+            span=loess_span,
+            min_spacing=do_min_spacing,
+            crossing_value=do_crossing_value
+        )
+    end
+
     n_do_events = length(do_event_indices)
     avg_waiting_time = length(do_waiting_times) > 0 ? mean(do_waiting_times) : 0.0
     
@@ -373,7 +409,8 @@ Optionally saves the full result to `save_dir/block_uncertainty_analysis.jld2`.
 function estimate_block_uncertainties(default_file::String, pdf_grid;
                                        block_size=6000, min_do_events=2,
                                        remove_spinup=true, spinup_fraction=0.02,
-                                       do_min_spacing=500, do_crossing_value=5.0,
+                                       do_min_spacing=500, do_crossing_value=-0.8,
+                                       do_method="upward_crossing",
                                        save_dir=nothing)
     println("  Reading default run: $default_file")
     amoc, time = read_climber_amoc(default_file)
@@ -419,7 +456,8 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
                                         threshold_method="clustering",
                                         loess_span=0.02,
                                         do_min_spacing=do_min_spacing,
-                                        do_crossing_value=do_crossing_value)
+                                        do_crossing_value=do_crossing_value,
+                                        do_method=do_method)
         block_wts[b]  = stats_b["avg_waiting_time"]
         block_sds[b]  = stats_b["avg_stadial_duration"]
         block_n_do[b] = stats_b["n_do_events"]

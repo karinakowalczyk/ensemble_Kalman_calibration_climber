@@ -62,11 +62,14 @@ const WAITING_TIME_UNCERTAINTY = 39.1  # years
 const STADIAL_DURATION_UNCERTAINTY = 42.6  # years
 
 # PCA calibration settings (used when calibration_mode = :pca)
-const N_PCA_COMPONENTS = 5
+const N_PCA_COMPONENTS = 3
 # Uncertainty per PCA component in PCA-projected PDF units.
 # Relative to WAITING_TIME_UNCERTAINTY this controls the weight of PDF shape
 # vs. dynamical statistics. Tune as needed.
 const PCA_COMPONENT_UNCERTAINTY = 1.0
+
+# Spinup to remove from each ensemble member run before computing statistics
+const ENSEMBLE_SPINUP_YEARS = 1000
 
 # ============================================
 # PCA PROJECTION UTILITIES
@@ -350,9 +353,10 @@ end
 Process CLIMBER-X output and extract PDF + dynamical statistics
 Returns: [pdf_values..., avg_waiting_time, avg_stadial_duration]
 """
-function process_climber_output_with_stats(output_file::String, pdf_grid; 
+function process_climber_output_with_stats(output_file::String, pdf_grid;
                                           remove_spinup=true, spinup_fraction=0.02,
-                                          do_min_spacing=500, do_crossing_value=5.0)
+                                          do_min_spacing=600, do_crossing_value=5.0,
+                                          do_method="loess")
     # Read AMOC
     amoc, time = read_climber_amoc(output_file)
     
@@ -372,8 +376,9 @@ function process_climber_output_with_stats(output_file::String, pdf_grid;
                                   ignore_first_stadial=true,
                                   loess_span=0.02,
                                   do_min_spacing=do_min_spacing,
-                                  do_crossing_value=do_crossing_value)
-    
+                                  do_crossing_value=do_crossing_value,
+                                  do_method=do_method)
+
     # Combine PDF + dynamical statistics
     calibration_vector = vcat(
         pdf_vals,                          # 100 values
@@ -410,9 +415,10 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
                     calibration_vector, stats = process_climber_output_with_stats(
                         tracker.output_file, pdf_grid,
                         remove_spinup=true,
-                        spinup_fraction=0.02,
-                        do_min_spacing=500,
-                        do_crossing_value=do_crossing_value
+                        spinup_fraction=ens_spinup_fraction,
+                        do_min_spacing=600,
+                        do_crossing_value=do_crossing_value,
+                        do_method=do_method
                     )
                     
                     # Normalize by uncertainties
@@ -504,7 +510,7 @@ end
 """
 Collect results from existing output files (for resuming)
 """
-function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0)
+function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", ens_spinup_fraction=0.02)
     n_outputs = length(y_obs)
     G_ensemble = zeros(n_outputs, N_ensemble)
     n_failures = 0
@@ -520,9 +526,10 @@ function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid,
                 calibration_vector, _ = process_climber_output_with_stats(
                     output_file, pdf_grid,
                     remove_spinup=true,
-                    spinup_fraction=0.02,
-                    do_min_spacing=500,
-                    do_crossing_value=do_crossing_value
+                    spinup_fraction=ens_spinup_fraction,
+                    do_min_spacing=600,
+                    do_crossing_value=do_crossing_value,
+                    do_method=do_method
                 )
                 G_ensemble[:, j] = normalize_observations(calibration_vector, uncertainties)
                 
@@ -724,11 +731,16 @@ function run_climber_x_calibration(;
     check_interval_minutes=30,
     max_wait_days=10,
     pdf_grid_points=100,
-    calibration_mode=:pca,   # :pca  → 5 PCA components + 2 stats (7 total)
-                              # :pdf  → full 100-point PDF + 2 stats (102 total)
-    nyears=7000,              # length of each ensemble run in years
-    do_crossing_value=5.0)    # AMOC residual threshold (Sv) for DO event detection
+    calibration_mode=:pca,        # :pca  → N_PCA_COMPONENTS + 2 stats
+                                  # :pdf  → full 100-point PDF + 2 stats (102 total)
+    nyears=7000,                  # length of each ensemble run in years
+    do_crossing_value=5.0,        # LOESS-residual threshold (Sv) for DO event detection
+    do_method="loess",            # detection method: "loess" or "upward_crossing"
+    spinup_years=0)               # spinup to discard from ensemble members (0 = use spinup_fraction=0.02)
     
+    # Derived spinup fraction for ensemble member runs
+    ens_spinup_fraction = spinup_years > 0 ? spinup_years / Float64(nyears) : 0.02
+
     println("="^80)
     println("CLIMBER-X EKI CALIBRATION - PDF + DYNAMICAL STATISTICS (NORMALIZED)")
     println("="^80)
@@ -738,6 +750,7 @@ function run_climber_x_calibration(;
     println("  - Average waiting time (σ = $WAITING_TIME_UNCERTAINTY years)")
     println("  - Average stadial duration (σ = $STADIAL_DURATION_UNCERTAINTY years)")
     println("  - All observations normalized by uncertainties for balanced fitting")
+    println("DO detection: method=$do_method  cv=$do_crossing_value  spinup=$(spinup_years > 0 ? "$(spinup_years) yr" : "$(round(Int, ens_spinup_fraction*nyears)) yr ($(ens_spinup_fraction*100)%)")")
     println("Ensemble size: $N_ensemble")
     println("Iterations: $N_iterations")
     println("Output directory: $output_dir")
@@ -874,15 +887,16 @@ function run_climber_x_calibration(;
         pdf_obs = compute_pdf_on_grid(amoc_default, pdf_grid, remove_spinup=false)
         
         # Compute dynamical statistics from default run
-        stats_default = compute_summary_stats(amoc_default; 
+        stats_default = compute_summary_stats(amoc_default;
                                              time_data=time_default,
                                              remove_spinup=false,
                                              spinup_fraction=0.0,
                                              adaptive_threshold=true,
                                              threshold_method="clustering",
                                              loess_span=0.02,
-                                             do_min_spacing=500,
-                                             do_crossing_value=do_crossing_value)
+                                             do_min_spacing=600,
+                                             do_crossing_value=do_crossing_value,
+                                             do_method=do_method)
         
         # Create raw observation vector
         y_obs_raw = vcat(
@@ -907,8 +921,9 @@ function run_climber_x_calibration(;
         println("\nEstimating observation uncertainties from default run blocks...")
         block_analysis = estimate_block_uncertainties(
             DEFAULT_RUN_OUTPUT, pdf_grid;
-            block_size=6000, min_do_events=2,
-            do_min_spacing=500, do_crossing_value=do_crossing_value,
+            block_size=7000, min_do_events=2,
+            do_min_spacing=600, do_crossing_value=do_crossing_value,
+            do_method=do_method,
             save_dir=output_dir
         )
 
@@ -1000,8 +1015,9 @@ function run_climber_x_calibration(;
         println("\nEstimating observation uncertainties from default run blocks (resumed run)...")
         block_analysis = estimate_block_uncertainties(
             DEFAULT_RUN_OUTPUT, pdf_grid;
-            block_size=6000, min_do_events=2,
-            do_min_spacing=500, do_crossing_value=do_crossing_value,
+            block_size=7000, min_do_events=2,
+            do_min_spacing=600, do_crossing_value=do_crossing_value,
+            do_method=do_method,
             save_dir=output_dir
         )
     end
@@ -1102,8 +1118,12 @@ function run_climber_x_calibration(;
                        if !any(isnan.(G_ensemble[:, j]))]
             pdf_matrix = hcat([G_ensemble[1:n_pdf, j] .* uncertainties_full[1:n_pdf]
                                for j in valid_j]...)
-            println("\n  Fitting PCA on $(length(valid_j)) ensemble PDFs (iteration $i)...")
-            pca_model = fit_pca_from_ensemble(pdf_matrix; n_components=N_PCA_COMPONENTS)
+            if isnothing(pca_model)
+                println("\n  Fitting PCA on $(length(valid_j)) ensemble PDFs (iteration $i — basis fixed for all subsequent iterations)...")
+                pca_model = fit_pca_from_ensemble(pdf_matrix; n_components=N_PCA_COMPONENTS)
+            else
+                println("\n  Using fixed PCA basis from iteration 1 ($(N_PCA_COMPONENTS) components)")
+            end
 
             # PCA component uncertainties: project stored block PDFs through the
             # current PCA model and take the std across valid blocks.
@@ -1224,9 +1244,10 @@ function run_climber_x_calibration(;
                 calibration_vector, _ = process_climber_output_with_stats(
                     output_file, pdf_grid,
                     remove_spinup=true,
-                    spinup_fraction=0.02,
-                    do_min_spacing=500,
-                    do_crossing_value=do_crossing_value
+                    spinup_fraction=ens_spinup_fraction,
+                    do_min_spacing=600,
+                    do_crossing_value=do_crossing_value,
+                    do_method=do_method
                 )
                 push!(valid_members, j)
                 push!(final_pdfs, calibration_vector[1:n_pdf])
@@ -1274,11 +1295,13 @@ end
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
     N_iterations=4,
     N_ensemble=60,
-    output_dir="/p/tmp/karinako/eki_calibration_7000_pca/output",
-    work_dir="/p/tmp/karinako/eki_calibration_7000_pca/working",
+    output_dir="/p/tmp/karinako/eki_calibration_7000_pca_v2/output",
+    work_dir="/p/tmp/karinako/eki_calibration_7000_pca_v2/working",
     check_interval_minutes=30,
     max_wait_days=10,
     pdf_grid_points=100,
     nyears=7000,
-    do_crossing_value=2.0
+    do_crossing_value=-0.8,
+    do_method="upward_crossing",
+    spinup_years=1000
 )
