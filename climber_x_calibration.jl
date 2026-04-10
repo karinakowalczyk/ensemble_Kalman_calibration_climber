@@ -43,14 +43,27 @@ const PARAM_NAMES = [
     "diff_dia_max"
 ]
 
-# Prior bounds (uniform distributions)
+# Prior bounds — plausible physical ranges expanded by 20% (±10% each side)
 const PRIOR_BOUNDS = Dict(
-    "diff_dia_min" => (6e-6, 1.4e-5),
-    "drag_topo_fac" => (2.6, 3.4),
-    "slope_max" => (6e-4, 1.4e-3),
-    "diff_iso" => (1100.0, 1900.0),
-    "diff_gm" => (1100.0, 1900.0),
-    "diff_dia_max" => (1.1e-4, 1.9e-4)
+    "diff_dia_min" => (3.5e-6,  2.15e-5),
+    "drag_topo_fac" => (2.4,    3.6),
+    "slope_max"    => (3.5e-4,  2.15e-3),
+    "diff_iso"     => (350.0,   2150.0),
+    "diff_gm"      => (350.0,   2150.0),
+    "diff_dia_max" => (9e-5,    2.1e-4)
+)
+
+# Prior centers in physical space: default values + 15% of total prior range.
+# Defaults: diff_dia_min=1e-5, drag_topo_fac=3.0, slope_max=1e-3,
+#           diff_iso=1500, diff_gm=1500, diff_dia_max=1.5e-4
+# This shifts the initial ensemble away from the known optimum as a proof-of-concept.
+const PRIOR_CENTER = Dict(
+    "diff_dia_min"  => 1.27e-5,   # 1e-5   + 0.15 * 1.8e-5
+    "drag_topo_fac" => 3.18,      # 3.0    + 0.15 * 1.2
+    "slope_max"     => 1.27e-3,   # 1e-3   + 0.15 * 1.8e-3
+    "diff_iso"      => 1770.0,    # 1500   + 0.15 * 1800
+    "diff_gm"       => 1770.0,
+    "diff_dia_max"  => 1.68e-4    # 1.5e-4 + 0.15 * 1.2e-4
 )
 
 # PDF calibration settings
@@ -793,10 +806,15 @@ function run_climber_x_calibration(;
         bounds = PRIOR_BOUNDS[name]
         lower = bounds[1]
         upper = bounds[2]
-        
-        # Use Parameterized with Uniform (NO additional constraint needed)
-        dist = Parameterized(Uniform(lower, upper))
-        push!(prior_dists, ParameterDistribution(dist, no_constraint(), name))
+
+        # bounded(lower, upper) maps physical [lower,upper] ↔ unconstrained (-∞,∞) via logit.
+        # The Normal mean φ_c is the logit of the normalised prior center, so the mode in
+        # physical space lands at PRIOR_CENTER[name] rather than the midpoint.
+        # σ=3 keeps the prior wide (approximately uniform coverage across the interval).
+        center = PRIOR_CENTER[name]
+        φ_c    = log((center - lower) / (upper - center))
+        dist   = Parameterized(Normal(φ_c, 3))
+        push!(prior_dists, ParameterDistribution(dist, bounded(lower, upper), name))
     end
 
     prior = combine_distributions(prior_dists)
@@ -1294,7 +1312,7 @@ end
 
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
     N_iterations=4,
-    N_ensemble=60,
+    N_ensemble=100,
     output_dir="/p/tmp/karinako/eki_calibration_7000_pca_v2/output",
     work_dir="/p/tmp/karinako/eki_calibration_7000_pca_v2/working",
     check_interval_minutes=30,
