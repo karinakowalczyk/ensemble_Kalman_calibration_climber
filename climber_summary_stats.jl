@@ -190,7 +190,7 @@ Returns: Dictionary with PDF, stadial info, DO events, etc.
 function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
                                spinup_fraction=0.02, adaptive_threshold=true,
                                threshold_method="clustering", threshold=nothing,
-                               x_grid=nothing, grid_points=100, ignore_first_stadial=true,
+                               grid_points=100, ignore_first_stadial=true,
                                loess_span=0.02, do_min_spacing=500, do_crossing_value=5.0,
                                do_method="loess", do_peak_threshold=14.0, pdf_prominence=0.05)
     # do_method: "loess"       — original LOESS detrend + peak detection (default)
@@ -210,13 +210,9 @@ function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
         time_data = time_data .- time_data[1]
     end
     
-    # Compute PDF using KDE on fixed grid (for PCA consistency) or per-run grid
+    # Compute PDF using KDE on a fixed AMOC grid (same for all runs, enabling PCA comparison)
     kde_obj = kde(amoc_data)
-    if isnothing(x_grid)
-        x_grid_eval = range(minimum(amoc_data), maximum(amoc_data), length=grid_points)
-    else
-        x_grid_eval = x_grid
-    end
+    x_grid_eval = range(0.0, 30.0, length=grid_points)
     pdf_vals = pdf(kde_obj, x_grid_eval)
     integral = sum((pdf_vals[1:end-1] .+ pdf_vals[2:end]) .* diff(collect(x_grid_eval))) / 2
     pdf_vals = pdf_vals ./ integral
