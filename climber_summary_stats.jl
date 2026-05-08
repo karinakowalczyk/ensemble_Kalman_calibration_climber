@@ -43,6 +43,33 @@ function detect_stadials_adaptive(amoc_smooth; method="clustering", offset=2.5)
 end
 
 """
+Return the x-value (Sv) of the leftmost prominent peak in a KDE PDF.
+Falls back to argmax if no prominent peaks are found.
+
+Used to distinguish DO runs (stadial peak at ~10 Sv) from wild oscillators
+(first peak at 14+ Sv, no low-AMOC state).
+"""
+function first_peak_location(pdf_vals, x_grid; prominence_frac=0.05)
+    prominence = prominence_frac * maximum(pdf_vals)
+    peaks = Int[]
+    for i in 2:(length(pdf_vals)-1)
+        if pdf_vals[i] > pdf_vals[i-1] && pdf_vals[i] > pdf_vals[i+1]
+            push!(peaks, i)
+        end
+    end
+    # Filter by prominence (must exceed local base by at least `prominence`)
+    prominent = filter(peaks) do p
+        left_min  = minimum(pdf_vals[max(1,p-20):p])
+        right_min = minimum(pdf_vals[p:min(length(pdf_vals),p+20)])
+        pdf_vals[p] - max(left_min, right_min) >= prominence
+    end
+    if isempty(prominent)
+        return x_grid[argmax(pdf_vals)]
+    end
+    return x_grid[prominent[1]]
+end
+
+"""
 Find positive peaks in signal
 """
 function find_peaks_positive(signal)
@@ -163,9 +190,9 @@ Returns: Dictionary with PDF, stadial info, DO events, etc.
 function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
                                spinup_fraction=0.02, adaptive_threshold=true,
                                threshold_method="clustering", threshold=nothing,
-                               grid_points=100, ignore_first_stadial=true,
+                               x_grid=nothing, grid_points=100, ignore_first_stadial=true,
                                loess_span=0.02, do_min_spacing=500, do_crossing_value=5.0,
-                               do_method="loess")
+                               do_method="loess", do_peak_threshold=14.0, pdf_prominence=0.05)
     # do_method: "loess"       — original LOESS detrend + peak detection (default)
     #            "stadial_end" — use stadial→interstadial threshold crossings directly
     amoc_data = vec(amoc_data)
@@ -183,11 +210,15 @@ function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
         time_data = time_data .- time_data[1]
     end
     
-    # Compute PDF using KDE
+    # Compute PDF using KDE on fixed grid (for PCA consistency) or per-run grid
     kde_obj = kde(amoc_data)
-    x_grid = range(minimum(amoc_data), maximum(amoc_data), length=grid_points)
-    pdf_vals = pdf(kde_obj, x_grid)
-    integral = sum((pdf_vals[1:end-1] .+ pdf_vals[2:end]) .* diff(x_grid)) / 2
+    if isnothing(x_grid)
+        x_grid_eval = range(minimum(amoc_data), maximum(amoc_data), length=grid_points)
+    else
+        x_grid_eval = x_grid
+    end
+    pdf_vals = pdf(kde_obj, x_grid_eval)
+    integral = sum((pdf_vals[1:end-1] .+ pdf_vals[2:end]) .* diff(collect(x_grid_eval))) / 2
     pdf_vals = pdf_vals ./ integral
     
     # Detect stadial threshold
@@ -255,10 +286,25 @@ function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
 
     n_do_events = length(do_event_indices)
     avg_waiting_time = length(do_waiting_times) > 0 ? mean(do_waiting_times) : 0.0
-    
+
+    # Classify as DO-variability or wild oscillator based on first PDF peak location.
+    # Wild oscillators have no low-AMOC stadial state; their first peak sits at high Sv.
+    fp_loc = first_peak_location(pdf_vals, collect(x_grid_eval); prominence_frac=pdf_prominence)
+    do_variability = fp_loc <= do_peak_threshold
+
+    # Zero out all DO event data for wild oscillators so they don't pollute SBI
+    if !do_variability
+        n_do_events          = 0
+        do_event_indices     = Int[]
+        do_times             = Float64[]
+        do_waiting_times     = Float64[]
+        avg_waiting_time     = 0.0
+        avg_stadial_duration = 0.0
+    end
+
     return Dict(
         "pdf" => pdf_vals,
-        "x_grid" => collect(x_grid),
+        "x_grid" => collect(x_grid_eval),
         "threshold" => threshold_val,
         "n_stadials" => n_stadials,
         "stadial_starts" => stadial_starts,
@@ -269,7 +315,8 @@ function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
         "do_event_indices" => do_event_indices,
         "do_times" => do_times,
         "waiting_times" => do_waiting_times,
-        "avg_waiting_time" => avg_waiting_time
+        "avg_waiting_time" => avg_waiting_time,
+        "do_variability" => do_variability
     )
 end
 
