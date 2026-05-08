@@ -896,10 +896,8 @@ function run_climber_x_calibration(;
         amoc_default = amoc_default[start_idx:end]
         time_default = time_default[start_idx:end]
         
-        # Create common grid spanning reasonable AMOC range
-        x_min = minimum(amoc_default) - 2.0
-        x_max = maximum(amoc_default) + 2.0
-        pdf_grid = range(x_min, x_max, length=pdf_grid_points)
+        # Fixed AMOC grid (matches compute_summary_stats, enabling consistent PCA comparison)
+        pdf_grid = range(0.0, 30.0, length=pdf_grid_points)
         
         # Compute default PDF on this grid
         pdf_obs = compute_pdf_on_grid(amoc_default, pdf_grid, remove_spinup=false)
@@ -927,7 +925,7 @@ function run_climber_x_calibration(;
         
         dx = step(pdf_grid)
 
-        println("  PDF grid: $(length(pdf_grid)) points from $(round(x_min, digits=2)) to $(round(x_max, digits=2))")
+        println("  PDF grid: $(length(pdf_grid)) points from $(round(first(pdf_grid), digits=2)) to $(round(last(pdf_grid), digits=2))")
         println("  Grid spacing (dx): $(round(dx, digits=4))")
         println("\n  Target observations (physical units):")
         println("    PDF max: $(round(maximum(pdf_obs), digits=4))")
