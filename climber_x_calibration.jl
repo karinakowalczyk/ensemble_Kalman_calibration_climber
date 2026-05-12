@@ -53,18 +53,31 @@ const PRIOR_BOUNDS = Dict(
     "diff_dia_max" => (9e-5,    2.1e-4)
 )
 
-# Prior centers in physical space: default values + 15% of total prior range.
-# Defaults: diff_dia_min=1e-5, drag_topo_fac=3.0, slope_max=1e-3,
-#           diff_iso=1500, diff_gm=1500, diff_dia_max=1.5e-4
-# This shifts the initial ensemble away from the known optimum as a proof-of-concept.
-const PRIOR_CENTER = Dict(
-    "diff_dia_min"  => 1.27e-5,   # 1e-5   + 0.15 * 1.8e-5
-    "drag_topo_fac" => 3.18,      # 3.0    + 0.15 * 1.2
-    "slope_max"     => 1.27e-3,   # 1e-3   + 0.15 * 1.8e-3
-    "diff_iso"      => 1770.0,    # 1500   + 0.15 * 1800
-    "diff_gm"       => 1770.0,
-    "diff_dia_max"  => 1.68e-4    # 1.5e-4 + 0.15 * 1.2e-4
-)
+# ── Parameter normalisation helpers ───────────────────────────────────────────
+# EKS operates in [0,1]-scaled space (one bounded unit interval per parameter).
+# Physical ↔ normalised conversions:
+param_lo(name)  = PRIOR_BOUNDS[name][1]
+param_hi(name)  = PRIOR_BOUNDS[name][2]
+
+normalise_param(θ, name)   = (θ - param_lo(name)) / (param_hi(name) - param_lo(name))
+denormalise_param(p, name) = param_lo(name) + p * (param_hi(name) - param_lo(name))
+
+# Matrix versions: rows = parameters, cols = ensemble members
+function normalise_params(θ_mat)
+    out = similar(θ_mat)
+    for (i, name) in enumerate(PARAM_NAMES)
+        out[i, :] .= normalise_param.(θ_mat[i, :], name)
+    end
+    return out
+end
+
+function denormalise_params(p_mat)
+    out = similar(p_mat)
+    for (i, name) in enumerate(PARAM_NAMES)
+        out[i, :] .= denormalise_param.(p_mat[i, :], name)
+    end
+    return out
+end
 
 # PDF calibration settings
 const PDF_GRID_POINTS = 100
@@ -215,9 +228,11 @@ function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir
         # Build parameter dictionary for this member
         params_dict = Dict{String, Any}()
         
-        # Add calibration parameters (with ocn. prefix)
+        # Add calibration parameters (with ocn. prefix).
+        # params_i is in [0,1] normalised space; denormalise to physical units for CLIMBER.
         for (idx, name) in enumerate(PARAM_NAMES)
-            params_dict["ocn.$(name)"] = params_i[idx, j]
+            p_norm = clamp(params_i[idx, j], 0.0, 1.0)
+            params_dict["ocn.$(name)"] = denormalise_param(p_norm, name)
         end
         
         # Add fixed parameters, then override nyears with the caller's value
@@ -409,7 +424,7 @@ end
 """
 Collect results from CLIMBER-X iteration using PDF + dynamical statistics
 """
-function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0)
+function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", ens_spinup_fraction=0.02)
     N_ensemble = length(job_trackers)
     n_outputs = length(y_obs)  # PDF grid points + 2 dynamical stats
     G_ensemble = zeros(n_outputs, N_ensemble)
@@ -803,27 +818,21 @@ function run_climber_x_calibration(;
     prior_dists = ParameterDistribution[]
 
     for name in PARAM_NAMES
-        bounds = PRIOR_BOUNDS[name]
-        lower = bounds[1]
-        upper = bounds[2]
-
-        # bounded(lower, upper) maps physical [lower,upper] ↔ unconstrained (-∞,∞) via logit.
-        # The Normal mean φ_c is the logit of the normalised prior center, so the mode in
-        # physical space lands at PRIOR_CENTER[name] rather than the midpoint.
-        # σ=3 keeps the prior wide (approximately uniform coverage across the interval).
-        center = PRIOR_CENTER[name]
-        φ_c    = log((center - lower) / (upper - center))
-        dist   = Parameterized(Normal(φ_c, 3))
-        push!(prior_dists, ParameterDistribution(dist, bounded(lower, upper), name))
+        # All parameters are normalised to [0,1] before EKS runs.
+        # Uniform(0,1) in unconstrained space (no_constraint) gives uniform coverage
+        # without boundary concentration.
+        dist = Parameterized(Uniform(0.0, 1.0))
+        push!(prior_dists, ParameterDistribution(dist, no_constraint(), name))
     end
 
     prior = combine_distributions(prior_dists)
 
     # Add diagnostic
-    println("\n  Verifying prior samples:")
+    println("\n  Verifying prior samples (physical space):")
     test_ensemble = construct_initial_ensemble(prior, 5)
+    test_ensemble_phys = denormalise_params(test_ensemble)
     for (idx, name) in enumerate(PARAM_NAMES)
-        println("    $(name): $(test_ensemble[idx, :])")
+        println("    $(name): $(test_ensemble_phys[idx, :])")
     end
     
     # Check for existing checkpoint to resume from
@@ -973,14 +982,15 @@ function run_climber_x_calibration(;
         initial_ensemble = construct_initial_ensemble(prior, N_ensemble)
         eks_process = Sampler(prior)
 
-        println("\n  DEBUG: Initial ensemble after construction:")
+        println("\n  DEBUG: Initial ensemble after construction (physical space):")
+        initial_ensemble_phys = denormalise_params(initial_ensemble)
         for j in 1:min(3, N_ensemble)
             println("  Member $j:")
             for (idx, name) in enumerate(PARAM_NAMES)
-                println("    $(name): $(initial_ensemble[idx, j])")
+                println("    $(name): $(initial_ensemble_phys[idx, j])")
             end
         end
-        
+
         eksobj = EnsembleKalmanProcess(
             initial_ensemble,
             y_obs,
@@ -991,21 +1001,22 @@ function run_climber_x_calibration(;
 
         # DEBUG: Verify the ensemble after EKI initialization
         params_after_init = get_ϕ_final(prior, eksobj)
-        println("\n  DEBUG: Ensemble after EKI initialization:")
+        params_after_init_phys = denormalise_params(params_after_init)
+        println("\n  DEBUG: Ensemble after EKI initialization (physical space):")
         for j in 1:min(3, N_ensemble)
             println("  Member $j:")
             for (idx, name) in enumerate(PARAM_NAMES)
-                println("    $(name): $(params_after_init[idx, j])")
+                println("    $(name): $(params_after_init_phys[idx, j])")
             end
         end
-        # Check if they match
-        println("\n  DEBUG: Comparing initial_ensemble vs get_ϕ_final:")
+        # Diff comparison stays in [0,1] space (both sides are normalised)
+        println("\n  DEBUG: Comparing initial_ensemble vs get_ϕ_final (normalised space):")
         for j in 1:min(3, N_ensemble)
             println("  Member $j max difference: $(maximum(abs.(initial_ensemble[:, j] .- params_after_init[:, j])))")
         end
         
         param_history = zeros(length(PARAM_NAMES), N_iterations + 1, N_ensemble)
-        param_history[:, 1, :] = get_ϕ_final(prior, eksobj)
+        param_history[:, 1, :] = denormalise_params(get_ϕ_final(prior, eksobj))
         
         metadata = Dict(
             "start_time" => now(),
@@ -1065,11 +1076,10 @@ function run_climber_x_calibration(;
         println("ITERATION $i/$N_iterations")
         println("="^80)
         
-        params_i = get_ϕ_final(prior, eksobj)
+        params_i_norm = get_ϕ_final(prior, eksobj)   # [0,1] normalised space
+        params_i      = denormalise_params(params_i_norm)  # physical space (for jobs + saving)
 
-        # Right after: params_i = get_ϕ_final(prior, eksobj)
-
-        println("\n  DEBUG: First 3 ensemble members:")
+        println("\n  DEBUG: First 3 ensemble members (physical space):")
         for j in 1:min(3, size(params_i, 2))
             println("  Member $j:")
             for (idx, name) in enumerate(PARAM_NAMES)
@@ -1103,9 +1113,9 @@ function run_climber_x_calibration(;
                 push!(job_trackers, tracker)
             end
         else
-            # Submit jobs
+            # Submit jobs (pass normalised params; function denormalises internally)
             job_trackers = submit_iteration_jobs_climber(
-                params_i, i, work_dir, output_dir; nyears=nyears
+                params_i_norm, i, work_dir, output_dir; nyears=nyears
             )
             
             save_job_trackers(job_trackers, i, output_dir)
@@ -1127,7 +1137,9 @@ function run_climber_x_calibration(;
         G_ensemble = collect_climber_iteration_results(job_trackers, pdf_grid,
                                                        y_obs_full, uncertainties_full,
                                                        max_failures_allowed=5,
-                                                       do_crossing_value=do_crossing_value)
+                                                       do_crossing_value=do_crossing_value,
+                                                       do_method=do_method,
+                                                       ens_spinup_fraction=ens_spinup_fraction)
 
         # ── PCA mode: refit PCA on current ensemble, then project ───────────
         if calibration_mode == :pca
@@ -1194,13 +1206,13 @@ function run_climber_x_calibration(;
         # Update ensemble
         println("\n  Updating ensemble with EKI...")
         update_ensemble!(eksobj, G_for_update)
-        param_history[:, i+1, :] = get_ϕ_final(prior, eksobj)
-        
-        # Current parameter estimates
-        current_mean = get_ϕ_mean_final(prior, eksobj)
-        current_std = std(get_ϕ_final(prior, eksobj), dims=2)
-        
-        println("\n  Current parameter estimates:")
+        param_history[:, i+1, :] = denormalise_params(get_ϕ_final(prior, eksobj))
+
+        # Current parameter estimates (denormalised to physical space for reporting)
+        current_mean = vec(denormalise_params(reshape(get_ϕ_mean_final(prior, eksobj), :, 1)))
+        current_std  = vec(std(denormalise_params(get_ϕ_final(prior, eksobj)), dims=2))
+
+        println("\n  Current parameter estimates (physical space):")
         for (idx, name) in enumerate(PARAM_NAMES)
             bounds = PRIOR_BOUNDS[name]
             println("    $(rpad(name, 20)): $(round(current_mean[idx], sigdigits=4)) ± $(round(current_std[idx], sigdigits=3)) (bounds: $(bounds))")
@@ -1224,9 +1236,9 @@ function run_climber_x_calibration(;
                        metadata, checkpoint_dir)
     end
     
-    # Final results
-    θ_optimal = get_ϕ_mean_final(prior, eksobj)
-    final_ensemble = get_ϕ_final(prior, eksobj)
+    # Final results (denormalised to physical space)
+    θ_optimal = vec(denormalise_params(reshape(get_ϕ_mean_final(prior, eksobj), :, 1)))
+    final_ensemble = denormalise_params(get_ϕ_final(prior, eksobj))
     θ_std = std(final_ensemble, dims=2)
     
     save_final_results(θ_optimal, vec(θ_std), final_ensemble,
@@ -1313,8 +1325,8 @@ end
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
     N_iterations=4,
     N_ensemble=100,
-    output_dir="/p/tmp/karinako/eki_calibration_7000_pca_v2/output",
-    work_dir="/p/tmp/karinako/eki_calibration_7000_pca_v2/working",
+    output_dir="/p/tmp/karinako/eki_calibration_7000_pca_v3/output",
+    work_dir="/p/tmp/karinako/eki_calibration_7000_pca_v3/working",
     check_interval_minutes=30,
     max_wait_days=10,
     pdf_grid_points=100,
