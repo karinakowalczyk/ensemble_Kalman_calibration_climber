@@ -50,23 +50,31 @@ Used to distinguish DO runs (stadial peak at ~10 Sv) from wild oscillators
 (first peak at 14+ Sv, no low-AMOC state).
 """
 function first_peak_location(pdf_vals, x_grid; prominence_frac=0.05)
-    prominence = prominence_frac * maximum(pdf_vals)
     peaks = Int[]
     for i in 2:(length(pdf_vals)-1)
         if pdf_vals[i] > pdf_vals[i-1] && pdf_vals[i] > pdf_vals[i+1]
             push!(peaks, i)
         end
     end
-    # Filter by prominence (must exceed local base by at least `prominence`)
+    # No local maxima at all — use global max as fallback
+    if isempty(peaks)
+        return x_grid[argmax(pdf_vals)]
+    end
+    # Filter by prominence (must stand out by at least prominence_frac * global_max)
+    prominence = prominence_frac * maximum(pdf_vals)
     prominent = filter(peaks) do p
         left_min  = minimum(pdf_vals[max(1,p-20):p])
         right_min = minimum(pdf_vals[p:min(length(pdf_vals),p+20)])
         pdf_vals[p] - max(left_min, right_min) >= prominence
     end
-    if isempty(prominent)
-        return x_grid[argmax(pdf_vals)]
+    # Prominent peaks found: return leftmost (stadial peak for DO runs)
+    if !isempty(prominent)
+        return x_grid[prominent[1]]
     end
-    return x_grid[prominent[1]]
+    # No prominent peaks — fall back to leftmost any peak, NOT argmax.
+    # argmax would return the interstadial peak (tall, >14 Sv) and wrongly
+    # classify DO runs where the stadial peak is small as wild oscillators.
+    return x_grid[peaks[1]]
 end
 
 """
