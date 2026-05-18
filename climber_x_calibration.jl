@@ -1325,8 +1325,8 @@ end
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
     N_iterations=4,
     N_ensemble=100,
-    output_dir="/p/tmp/karinako/eki_calibration_7000_pca_v3/output",
-    work_dir="/p/tmp/karinako/eki_calibration_7000_pca_v3/working",
+    output_dir="/p/tmp/karinako/eki_calibration_7000_pca_v4/output",
+    work_dir="/p/tmp/karinako/eki_calibration_7000_pca_v4/working",
     check_interval_minutes=30,
     max_wait_days=10,
     pdf_grid_points=100,
