@@ -84,11 +84,11 @@ const PDF_GRID_POINTS = 100
 const PDF_TOLERANCE = 0.03  # L2 distance tolerance for PDF (equivalent to ~0.01 supremum)
 
 # Dynamical statistics uncertainties (from your original setup)
-const WAITING_TIME_UNCERTAINTY = 39.1  # years
-const STADIAL_DURATION_UNCERTAINTY = 42.6  # years
+const WAITING_TIME_UNCERTAINTY = 200  # years
+const STADIAL_DURATION_UNCERTAINTY = 150  # years
 
 # PCA calibration settings (used when calibration_mode = :pca)
-const N_PCA_COMPONENTS = 3
+const N_PCA_COMPONENTS = 5
 # Uncertainty per PCA component in PCA-projected PDF units.
 # Relative to WAITING_TIME_UNCERTAINTY this controls the weight of PDF shape
 # vs. dynamical statistics. Tune as needed.
