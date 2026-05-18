@@ -140,63 +140,86 @@ end
 """
 Wait for all jobs in an iteration to complete
 """
-function wait_for_iteration_completion(job_trackers; 
+function wait_for_iteration_completion(job_trackers;
                                        check_interval_minutes=30,
                                        max_wait_days=10,
-                                       output_dir=nothing)
-    
+                                       output_dir=nothing,
+                                       max_unknown_checks=3)
+
     println("\n  Waiting for jobs to complete...")
     println("  Checking every $check_interval_minutes minutes")
-    
+
     start_time = now()
     max_wait = Dates.Day(max_wait_days)
-    
+    # Per-tracker count of consecutive :unknown SLURM responses
+    unknown_counts = Dict(tracker.job_id => 0 for tracker in job_trackers)
+
     while true
         for tracker in job_trackers
             if tracker.status in [:submitted, :running]
-                new_status = check_job_status(tracker.job_id, max_retries=3, initial_delay=5)
-                
-                if new_status == :completed && tracker.status != :completed
+                # Ground-truth check: valid output file means the run finished,
+                # regardless of what SLURM reports.
+                if validate_climber_output_file(tracker.output_file)[1]
                     tracker.status = :completed
                     tracker.completion_time = now()
-                    
-                elseif new_status in [:failed, :timeout, :oom] && tracker.status != new_status
+                    println("    Member $(tracker.member_id): output file valid — marking completed")
+                    continue
+                end
+
+                new_status = check_job_status(tracker.job_id, max_retries=3, initial_delay=5)
+
+                if new_status == :completed
+                    # SLURM says COMPLETED but the file check above failed —
+                    # the run likely diverged and exited cleanly without producing output.
+                    tracker.status = :failed
+                    tracker.completion_time = now()
+                    @warn "Member $(tracker.member_id): SLURM COMPLETED but output invalid — treating as failed"
+
+                elseif new_status in [:failed, :timeout, :oom, :cancelled]
                     tracker.status = new_status
                     tracker.completion_time = now()
-                    @warn "Job $(tracker.member_id) status: $new_status"
-                    
+                    @warn "Member $(tracker.member_id) SLURM status: $new_status"
+
                 elseif new_status == :running && tracker.status == :submitted
                     tracker.status = :running
+
+                elseif new_status == :unknown
+                    unknown_counts[tracker.job_id] += 1
+                    if unknown_counts[tracker.job_id] >= max_unknown_checks
+                        tracker.status = :failed
+                        tracker.completion_time = now()
+                        @warn "Member $(tracker.member_id): SLURM status unknown for $max_unknown_checks consecutive checks — treating as failed (likely diverged)"
+                    end
                 end
             end
         end
-        
+
         n_completed = count(t -> t.status == :completed, job_trackers)
-        n_failed = count(t -> t.status in [:failed, :timeout, :oom], job_trackers)
-        n_pending = count(t -> t.status in [:submitted, :running], job_trackers)
-        
+        n_failed    = count(t -> t.status in [:failed, :timeout, :oom, :cancelled], job_trackers)
+        n_pending   = count(t -> t.status in [:submitted, :running], job_trackers)
+
         println("    [$(now())] Status: $n_completed completed, $n_failed failed, $n_pending pending")
-        
+
         if output_dir !== nothing
             check_disk_space(output_dir, min_gb_required=50, warn_gb=100)
         end
-        
-        if n_completed == length(job_trackers)
-            println("  ✓ All jobs completed successfully!")
-            return :success
+
+        if n_pending == 0
+            if n_failed == 0
+                println("  ✓ All jobs completed successfully!")
+                return :success
+            else
+                @warn "Jobs finished with failures: $n_completed completed, $n_failed failed"
+                return :partial_failure
+            end
         end
-        
-        if n_failed > 0 && n_pending == 0
-            @warn "Jobs finished with failures: $n_completed completed, $n_failed failed"
-            return :partial_failure
-        end
-        
+
         elapsed = now() - start_time
         if elapsed > max_wait
             @warn "Maximum wait time exceeded ($max_wait_days days)"
             return :timeout
         end
-        
+
         sleep(check_interval_minutes * 60)
     end
 end
