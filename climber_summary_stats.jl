@@ -460,8 +460,8 @@ Optionally saves the full result to `save_dir/block_uncertainty_analysis.jld2`.
 function estimate_block_uncertainties(default_file::String, pdf_grid;
                                        block_size=6000, min_do_events=2,
                                        remove_spinup=true, spinup_fraction=0.02,
-                                       do_min_spacing=500, do_crossing_value=-0.8,
-                                       do_method="upward_crossing",
+                                       do_min_spacing=500, do_crossing_value=5.0,
+                                       do_method="loess", loess_span=0.02,
                                        save_dir=nothing)
     println("  Reading default run: $default_file")
     amoc, time = read_climber_amoc(default_file)
@@ -505,7 +505,7 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
                                         spinup_fraction=0.0,
                                         adaptive_threshold=true,
                                         threshold_method="clustering",
-                                        loess_span=0.02,
+                                        loess_span=loess_span,
                                         do_min_spacing=do_min_spacing,
                                         do_crossing_value=do_crossing_value,
                                         do_method=do_method)

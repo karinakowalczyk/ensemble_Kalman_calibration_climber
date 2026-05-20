@@ -384,7 +384,7 @@ Returns: [pdf_values..., avg_waiting_time, avg_stadial_duration]
 function process_climber_output_with_stats(output_file::String, pdf_grid;
                                           remove_spinup=true, spinup_fraction=0.02,
                                           do_min_spacing=600, do_crossing_value=5.0,
-                                          do_method="loess")
+                                          do_method="loess", loess_span=0.02)
     # Read AMOC
     amoc, time = read_climber_amoc(output_file)
     
@@ -394,7 +394,7 @@ function process_climber_output_with_stats(output_file::String, pdf_grid;
                                    spinup_fraction=spinup_fraction)
     
     # Compute summary statistics (from your climber_summary_stats.jl)
-    stats = compute_summary_stats(amoc; 
+    stats = compute_summary_stats(amoc;
                                   time_data=time,
                                   remove_spinup=remove_spinup,
                                   spinup_fraction=spinup_fraction,
@@ -402,7 +402,7 @@ function process_climber_output_with_stats(output_file::String, pdf_grid;
                                   threshold_method="clustering",
                                   grid_points=length(pdf_grid),
                                   ignore_first_stadial=true,
-                                  loess_span=0.02,
+                                  loess_span=loess_span,
                                   do_min_spacing=do_min_spacing,
                                   do_crossing_value=do_crossing_value,
                                   do_method=do_method)
@@ -424,7 +424,7 @@ end
 """
 Collect results from CLIMBER-X iteration using PDF + dynamical statistics
 """
-function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", ens_spinup_fraction=0.02)
+function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02)
     N_ensemble = length(job_trackers)
     n_outputs = length(y_obs)  # PDF grid points + 2 dynamical stats
     G_ensemble = zeros(n_outputs, N_ensemble)
@@ -446,7 +446,8 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
                         spinup_fraction=ens_spinup_fraction,
                         do_min_spacing=600,
                         do_crossing_value=do_crossing_value,
-                        do_method=do_method
+                        do_method=do_method,
+                        loess_span=loess_span
                     )
                     
                     # Normalize by uncertainties
@@ -538,7 +539,7 @@ end
 """
 Collect results from existing output files (for resuming)
 """
-function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", ens_spinup_fraction=0.02)
+function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02)
     n_outputs = length(y_obs)
     G_ensemble = zeros(n_outputs, N_ensemble)
     n_failures = 0
@@ -557,7 +558,8 @@ function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid,
                     spinup_fraction=ens_spinup_fraction,
                     do_min_spacing=600,
                     do_crossing_value=do_crossing_value,
-                    do_method=do_method
+                    do_method=do_method,
+                    loess_span=loess_span
                 )
                 G_ensemble[:, j] = normalize_observations(calibration_vector, uncertainties)
                 
@@ -764,6 +766,7 @@ function run_climber_x_calibration(;
     nyears=7000,                  # length of each ensemble run in years
     do_crossing_value=5.0,        # LOESS-residual threshold (Sv) for DO event detection
     do_method="loess",            # detection method: "loess" or "upward_crossing"
+    loess_span=0.25,              # LOESS smoothing span (fraction of data); 0.25 ≈ 1500-yr window on 6000-yr runs
     spinup_years=0)               # spinup to discard from ensemble members (0 = use spinup_fraction=0.02)
     
     # Derived spinup fraction for ensemble member runs
@@ -920,10 +923,10 @@ function run_climber_x_calibration(;
                                              spinup_fraction=0.0,
                                              adaptive_threshold=true,
                                              threshold_method="clustering",
-                                             loess_span=0.02,
+                                             loess_span=loess_span,
                                              do_min_spacing=500,
-                                             do_crossing_value=5.0,
-                                             do_method="loess")
+                                             do_crossing_value=do_crossing_value,
+                                             do_method=do_method)
         
         # Create raw observation vector
         y_obs_raw = vcat(
@@ -950,7 +953,7 @@ function run_climber_x_calibration(;
             DEFAULT_RUN_OUTPUT, pdf_grid;
             block_size=7000, min_do_events=2,
             do_min_spacing=600, do_crossing_value=do_crossing_value,
-            do_method=do_method,
+            do_method=do_method, loess_span=loess_span,
             save_dir=output_dir
         )
 
@@ -1046,7 +1049,7 @@ function run_climber_x_calibration(;
             DEFAULT_RUN_OUTPUT, pdf_grid;
             block_size=7000, min_do_events=2,
             do_min_spacing=600, do_crossing_value=do_crossing_value,
-            do_method=do_method,
+            do_method=do_method, loess_span=loess_span,
             save_dir=output_dir
         )
     end
@@ -1139,6 +1142,7 @@ function run_climber_x_calibration(;
                                                        max_failures_allowed=5,
                                                        do_crossing_value=do_crossing_value,
                                                        do_method=do_method,
+                                                       loess_span=loess_span,
                                                        ens_spinup_fraction=ens_spinup_fraction)
 
         # ── PCA mode: refit PCA on current ensemble, then project ───────────
@@ -1277,7 +1281,8 @@ function run_climber_x_calibration(;
                     spinup_fraction=ens_spinup_fraction,
                     do_min_spacing=600,
                     do_crossing_value=do_crossing_value,
-                    do_method=do_method
+                    do_method=do_method,
+                    loess_span=loess_span
                 )
                 push!(valid_members, j)
                 push!(final_pdfs, calibration_vector[1:n_pdf])
@@ -1331,7 +1336,8 @@ eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibra
     max_wait_days=10,
     pdf_grid_points=100,
     nyears=7000,
-    do_crossing_value=-0.8,
-    do_method="upward_crossing",
+    do_crossing_value=5.0,
+    do_method="loess",
+    loess_span=0.25,
     spinup_years=1000
 )
