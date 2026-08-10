@@ -53,6 +53,35 @@ const PRIOR_BOUNDS = Dict(
     "diff_dia_max" => (9e-5,    2.1e-4)
 )
 
+# ── GPC-derived Gaussian prior ────────────────────────────────────────────────
+# Mean/covariance of a multivariate Gaussian fit to the GP classifier's
+# P(DO variability | θ) surface, restricted to the high-confidence region
+# P(DO) > 0.85 (the "threshold" variant — matches the emulation-calibration
+# approach's DO-enriched-PPE selection criterion, rather than weighting the
+# whole prior box by classifier confidence). Physical units.
+#
+# Provenance: gpc_gaussian_prior.ipynb, sections 3.1/4, `threshold_p0.85`
+# variant, fit to the ppe_wide_500_10ky GPC. Also saved at
+# data/gpc_gaussian_prior/gpc_gaussian_prior.json. Regenerate that notebook
+# and update the numbers below if the wide PPE or GPC settings change.
+const GPC_PRIOR_MEAN_PHYS = Dict(
+    "diff_dia_min"  => 1.0570920362821298e-05,
+    "drag_topo_fac" => 3.0573768898450484,
+    "slope_max"     => 0.0015238910625262354,
+    "diff_iso"      => 1413.6633541259116,
+    "diff_gm"       => 1386.1937449763843,
+    "diff_dia_max"  => 0.00015465719812703636,
+)
+# Row/column order matches PARAM_NAMES.
+const GPC_PRIOR_COV_PHYS = [
+    1.4275432276141553e-11   3.7532190321636104e-07   2.2445262081538398e-10   7.414981270814958e-05    0.0009169362866229379   -5.696750172344651e-12;
+    3.7532190321636104e-07   0.11653475520271711     -1.1156654678524905e-06   44.781622976806545       -6.932422798632784       -1.979157243553281e-06;
+    2.2445262081538398e-10  -1.1156654678524905e-06   1.3035683983603807e-07   0.030346300784264712     -0.012283538443238817     1.3735856274333107e-09;
+    7.414981270814958e-05    44.781622976806545        0.030346300784264712    151865.75048221863        10212.20545424964        -0.003703530560656238;
+    0.0009169362866229379   -6.932422798632784        -0.012283538443238817    10212.20545424964         139385.80236113787        0.003732919306667277;
+   -5.696750172344651e-12   -1.979157243553281e-06     1.3735856274333107e-09  -0.003703530560656238      0.003732919306667277      1.0824359444561454e-09
+]
+
 # ── Parameter normalisation helpers ───────────────────────────────────────────
 # EKS operates in [0,1]-scaled space (one bounded unit interval per parameter).
 # Physical ↔ normalised conversions:
@@ -384,15 +413,16 @@ Returns: [pdf_values..., avg_waiting_time, avg_stadial_duration]
 function process_climber_output_with_stats(output_file::String, pdf_grid;
                                           remove_spinup=true, spinup_fraction=0.02,
                                           do_min_spacing=600, do_crossing_value=5.0,
-                                          do_method="loess", loess_span=0.02)
+                                          do_method="loess", loess_span=0.02,
+                                          n_threshold::Int=1)
     # Read AMOC
     amoc, time = read_climber_amoc(output_file)
-    
+
     # Compute PDF on common grid
-    pdf_vals = compute_pdf_on_grid(amoc, pdf_grid, 
-                                   remove_spinup=remove_spinup, 
+    pdf_vals = compute_pdf_on_grid(amoc, pdf_grid,
+                                   remove_spinup=remove_spinup,
                                    spinup_fraction=spinup_fraction)
-    
+
     # Compute summary statistics (from your climber_summary_stats.jl)
     stats = compute_summary_stats(amoc;
                                   time_data=time,
@@ -405,7 +435,8 @@ function process_climber_output_with_stats(output_file::String, pdf_grid;
                                   loess_span=loess_span,
                                   do_min_spacing=do_min_spacing,
                                   do_crossing_value=do_crossing_value,
-                                  do_method=do_method)
+                                  do_method=do_method,
+                                  n_threshold=n_threshold)
 
     # Combine PDF + dynamical statistics
     calibration_vector = vcat(
@@ -424,7 +455,7 @@ end
 """
 Collect results from CLIMBER-X iteration using PDF + dynamical statistics
 """
-function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02)
+function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02, n_threshold::Int=1)
     N_ensemble = length(job_trackers)
     n_outputs = length(y_obs)  # PDF grid points + 2 dynamical stats
     G_ensemble = zeros(n_outputs, N_ensemble)
@@ -447,7 +478,8 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
                         do_min_spacing=600,
                         do_crossing_value=do_crossing_value,
                         do_method=do_method,
-                        loess_span=loess_span
+                        loess_span=loess_span,
+                        n_threshold=n_threshold
                     )
                     
                     # Normalize by uncertainties
@@ -539,7 +571,7 @@ end
 """
 Collect results from existing output files (for resuming)
 """
-function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02)
+function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02, n_threshold::Int=1)
     n_outputs = length(y_obs)
     G_ensemble = zeros(n_outputs, N_ensemble)
     n_failures = 0
@@ -559,7 +591,8 @@ function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid,
                     do_min_spacing=600,
                     do_crossing_value=do_crossing_value,
                     do_method=do_method,
-                    loess_span=loess_span
+                    loess_span=loess_span,
+                    n_threshold=n_threshold
                 )
                 G_ensemble[:, j] = normalize_observations(calibration_vector, uncertainties)
                 
@@ -767,7 +800,8 @@ function run_climber_x_calibration(;
     do_crossing_value=5.0,        # LOESS-residual threshold (Sv) for DO event detection
     do_method="loess",            # detection method: "loess" or "upward_crossing"
     loess_span=0.25,              # LOESS smoothing span (fraction of data); 0.25 ≈ 1500-yr window on 6000-yr runs
-    spinup_years=0)               # spinup to discard from ensemble members (0 = use spinup_fraction=0.02)
+    spinup_years=0,               # spinup to discard from ensemble members (0 = use spinup_fraction=0.02)
+    n_threshold::Int=1)           # min n_do_events required for do_variability=true (matches summary_stats.py)
     
     # Derived spinup fraction for ensemble member runs
     ens_spinup_fraction = spinup_years > 0 ? spinup_years / Float64(nyears) : 0.02
@@ -817,18 +851,28 @@ function run_climber_x_calibration(;
     
     println("\nSetting up prior distributions...")
 
-    # Create parameter distributions
-    prior_dists = ParameterDistribution[]
+    # Joint Gaussian prior (GPC_PRIOR_MEAN_PHYS / GPC_PRIOR_COV_PHYS above),
+    # replacing the previous independent-per-parameter Uniform(0,1). All
+    # parameters are still normalised to [0,1] before EKS runs (no_constraint,
+    # as before) -- the physical-space Gaussian is mapped into that same
+    # [0,1] space via the same affine normalise_param transform, so it stays
+    # exactly Gaussian (no distortion from a nonlinear bounded transform).
+    # This is one *joint* multivariate distribution (not combine_distributions
+    # of independent ones), so it carries the correlations the GPC learned
+    # between parameters (e.g. diff_dia_min vs diff_gm).
+    μ_phys = [GPC_PRIOR_MEAN_PHYS[name] for name in PARAM_NAMES]
+    lo_vec = [param_lo(name) for name in PARAM_NAMES]
+    hi_vec = [param_hi(name) for name in PARAM_NAMES]
+    D = Diagonal(1.0 ./ (hi_vec .- lo_vec))
 
-    for name in PARAM_NAMES
-        # All parameters are normalised to [0,1] before EKS runs.
-        # Uniform(0,1) in unconstrained space (no_constraint) gives uniform coverage
-        # without boundary concentration.
-        dist = Parameterized(Uniform(0.0, 1.0))
-        push!(prior_dists, ParameterDistribution(dist, no_constraint(), name))
-    end
+    μ_prior_norm = D * (μ_phys .- lo_vec)
+    Σ_prior_norm = Symmetric(D * GPC_PRIOR_COV_PHYS * D)
 
-    prior = combine_distributions(prior_dists)
+    prior = ParameterDistribution(
+        Parameterized(MvNormal(μ_prior_norm, Σ_prior_norm)),
+        repeat([no_constraint()], length(PARAM_NAMES)),
+        "ocean_params",
+    )
 
     # Add diagnostic
     println("\n  Verifying prior samples (physical space):")
@@ -837,6 +881,11 @@ function run_climber_x_calibration(;
     for (idx, name) in enumerate(PARAM_NAMES)
         println("    $(name): $(test_ensemble_phys[idx, :])")
     end
+    println("\n  NOTE: unlike the old Uniform(0,1) prior, a Gaussian has unbounded")
+    println("  support in normalised space -- individual draws above can occasionally")
+    println("  fall outside [0,1] (i.e. outside PRIOR_BOUNDS). submit_iteration_jobs_climber")
+    println("  already clamps to [0,1] before denormalising for the actual CLIMBER-X job")
+    println("  submission, so this is safe, but keep an eye on how often it triggers.")
     
     # Check for existing checkpoint to resume from
     start_iteration   = 1
@@ -908,8 +957,10 @@ function run_climber_x_calibration(;
         amoc_default = amoc_default[start_idx:end]
         time_default = time_default[start_idx:end]
         
-        # Fixed AMOC grid (matches compute_summary_stats, enabling consistent PCA comparison)
-        pdf_grid = range(0.0, 30.0, length=pdf_grid_points)
+        # Fixed AMOC grid (matches compute_summary_stats, enabling consistent PCA comparison).
+        # Upper bound 35 (not 30): real PPE data has ~0.2-0.6% of timepoints above 30 Sv but
+        # only ~0.02% above 35 (default run itself peaks at 33.5 Sv) -- see climber_summary_stats.jl.
+        pdf_grid = range(0.0, 35.0, length=pdf_grid_points)
         
         # Compute default PDF on this grid
         pdf_obs = compute_pdf_on_grid(amoc_default, pdf_grid, remove_spinup=false)
@@ -917,6 +968,9 @@ function run_climber_x_calibration(;
         # Compute dynamical statistics from default run
         # Default run always uses the original LOESS + peak-walkback detection
         # (do_method="loess", crossing_value=5.0) regardless of ensemble settings.
+        # do_min_spacing=600 to match every ensemble-member call site below (was 500 --
+        # comparing the calibration target against predictions computed with different
+        # DO-detection settings; 600 also matches DO_MIN_SPACING in the emulator approach).
         stats_default = compute_summary_stats(amoc_default;
                                              time_data=time_default,
                                              remove_spinup=false,
@@ -924,9 +978,10 @@ function run_climber_x_calibration(;
                                              adaptive_threshold=true,
                                              threshold_method="clustering",
                                              loess_span=loess_span,
-                                             do_min_spacing=500,
+                                             do_min_spacing=600,
                                              do_crossing_value=do_crossing_value,
-                                             do_method=do_method)
+                                             do_method=do_method,
+                                             n_threshold=n_threshold)
         
         # Create raw observation vector
         y_obs_raw = vcat(
@@ -954,6 +1009,7 @@ function run_climber_x_calibration(;
             block_size=7000, min_do_events=2,
             do_min_spacing=600, do_crossing_value=do_crossing_value,
             do_method=do_method, loess_span=loess_span,
+            n_threshold=n_threshold,
             save_dir=output_dir
         )
 
@@ -1050,6 +1106,7 @@ function run_climber_x_calibration(;
             block_size=7000, min_do_events=2,
             do_min_spacing=600, do_crossing_value=do_crossing_value,
             do_method=do_method, loess_span=loess_span,
+            n_threshold=n_threshold,
             save_dir=output_dir
         )
     end
@@ -1143,7 +1200,8 @@ function run_climber_x_calibration(;
                                                        do_crossing_value=do_crossing_value,
                                                        do_method=do_method,
                                                        loess_span=loess_span,
-                                                       ens_spinup_fraction=ens_spinup_fraction)
+                                                       ens_spinup_fraction=ens_spinup_fraction,
+                                                       n_threshold=n_threshold)
 
         # ── PCA mode: refit PCA on current ensemble, then project ───────────
         if calibration_mode == :pca
@@ -1282,7 +1340,8 @@ function run_climber_x_calibration(;
                     do_min_spacing=600,
                     do_crossing_value=do_crossing_value,
                     do_method=do_method,
-                    loess_span=loess_span
+                    loess_span=loess_span,
+                    n_threshold=n_threshold
                 )
                 push!(valid_members, j)
                 push!(final_pdfs, calibration_vector[1:n_pdf])
@@ -1328,10 +1387,10 @@ end
 # ============================================
 
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
-    N_iterations=4,
-    N_ensemble=100,
-    output_dir="/p/tmp/karinako/eki_calibration_7000_pca_v4/output",
-    work_dir="/p/tmp/karinako/eki_calibration_7000_pca_v4/working",
+    N_iterations=3,
+    N_ensemble=60,
+    output_dir="/p/tmp/karinako/eki_calibration_test/output",
+    work_dir="/p/tmp/karinako/eki_calibration_test/working",
     check_interval_minutes=30,
     max_wait_days=10,
     pdf_grid_points=100,
@@ -1339,5 +1398,6 @@ eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibra
     do_crossing_value=5.0,
     do_method="loess",
     loess_span=0.25,
-    spinup_years=1000
+    spinup_years=1000,
+    n_threshold=1          # min n_do_events required for do_variability=true (matches summary_stats.py)
 )

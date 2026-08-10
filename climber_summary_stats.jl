@@ -199,8 +199,9 @@ function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
                                spinup_fraction=0.02, adaptive_threshold=true,
                                threshold_method="clustering", threshold=nothing,
                                grid_points=100, ignore_first_stadial=true,
-                               loess_span=0.02, do_min_spacing=500, do_crossing_value=5.0,
-                               do_method="loess", do_peak_threshold=14.0, pdf_prominence=0.05)
+                               loess_span=0.02, do_min_spacing=600, do_crossing_value=5.0,
+                               do_method="loess", do_peak_threshold=14.0, pdf_prominence=0.05,
+                               n_threshold::Int=1)
     # do_method: "loess"       — original LOESS detrend + peak detection (default)
     #            "stadial_end" — use stadial→interstadial threshold crossings directly
     amoc_data = vec(amoc_data)
@@ -218,9 +219,12 @@ function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
         time_data = time_data .- time_data[1]
     end
     
-    # Compute PDF using KDE on a fixed AMOC grid (same for all runs, enabling PCA comparison)
+    # Compute PDF using KDE on a fixed AMOC grid (same for all runs, enabling PCA comparison).
+    # Upper bound 35 (not 30): real PPE data (ppe_wide_500_10ky, DO-region PPE, and even the
+    # default run itself, max 33.5 Sv) has ~0.2-0.6% of timepoints above 30 Sv but only
+    # ~0.02% above 35 -- 30 was clipping real mass, 35 covers roughly the 99.98th percentile.
     kde_obj = kde(amoc_data)
-    x_grid_eval = range(0.0, 30.0, length=grid_points)
+    x_grid_eval = range(0.0, 35.0, length=grid_points)
     pdf_vals = pdf(kde_obj, x_grid_eval)
     integral = sum((pdf_vals[1:end-1] .+ pdf_vals[2:end]) .* diff(collect(x_grid_eval))) / 2
     pdf_vals = pdf_vals ./ integral
@@ -293,8 +297,10 @@ function compute_summary_stats(amoc_data; time_data=nothing, remove_spinup=true,
 
     # Classify as DO-variability or wild oscillator based on first PDF peak location.
     # Wild oscillators have no low-AMOC stadial state; their first peak sits at high Sv.
+    # Also require at least n_threshold detected DO events (matches summary_stats.py's
+    # do_variability = (fp_loc <= threshold) and (n_do_events > 0) when n_threshold=1).
     fp_loc = first_peak_location(pdf_vals, collect(x_grid_eval); prominence_frac=pdf_prominence)
-    do_variability = fp_loc <= do_peak_threshold
+    do_variability = fp_loc <= do_peak_threshold && n_do_events >= n_threshold
 
     # Zero out all DO event data for wild oscillators so they don't pollute SBI
     if !do_variability
@@ -368,7 +374,7 @@ function process_climber_output(output_file::String, pca_model;
                                   grid_points=100,
                                   ignore_first_stadial=true,
                                   loess_span=0.02,
-                                  do_min_spacing=500,
+                                  do_min_spacing=600,
                                   do_crossing_value=do_crossing_value)
     
     # Transform PDF to PCA space
@@ -460,8 +466,9 @@ Optionally saves the full result to `save_dir/block_uncertainty_analysis.jld2`.
 function estimate_block_uncertainties(default_file::String, pdf_grid;
                                        block_size=6000, min_do_events=2,
                                        remove_spinup=true, spinup_fraction=0.02,
-                                       do_min_spacing=500, do_crossing_value=5.0,
+                                       do_min_spacing=600, do_crossing_value=5.0,
                                        do_method="loess", loess_span=0.02,
+                                       n_threshold::Int=1,
                                        save_dir=nothing)
     println("  Reading default run: $default_file")
     amoc, time = read_climber_amoc(default_file)
@@ -508,7 +515,8 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
                                         loess_span=loess_span,
                                         do_min_spacing=do_min_spacing,
                                         do_crossing_value=do_crossing_value,
-                                        do_method=do_method)
+                                        do_method=do_method,
+                                        n_threshold=n_threshold)
         block_wts[b]  = stats_b["avg_waiting_time"]
         block_sds[b]  = stats_b["avg_stadial_duration"]
         block_n_do[b] = stats_b["n_do_events"]
