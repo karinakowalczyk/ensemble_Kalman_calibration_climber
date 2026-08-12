@@ -131,54 +131,35 @@ const ENSEMBLE_SPINUP_YEARS = 1000
 # ============================================
 
 """
-Project a full G_ensemble (n_pdf+2 × N, normalised by uncertainties_full) into
-PCA observation space (N_PCA_COMPONENTS+2 × N, normalised by uncertainties_pca).
+Project a full G_ensemble (n_pdf+2 × N, physical units) into PCA observation
+space (N_PCA_COMPONENTS+2 × N, physical units).
 
 Only the first n_pdf rows (PDF values) are projected through PCA; the last two
-rows (waiting time, stadial duration) are passed through after
-denormalise → renormalise with their respective uncertainties.
+rows (waiting time, stadial duration) are passed through unchanged. Everything
+stays in physical units -- observation uncertainty is carried by obs_noise_cov
+(passed to EnsembleKalmanProcess), not baked into the data, matching how the
+emulator+MCMC approach's Gaussian likelihood works directly in physical units.
 """
-function project_g_to_pca(G_ensemble_full, pca_model, n_pdf, uncertainties_full, uncertainties_pca)
+function project_g_to_pca(G_ensemble_full, pca_model, n_pdf)
     N     = size(G_ensemble_full, 2)
     n_pca = N_PCA_COMPONENTS
     G_pca = zeros(n_pca + 2, N)
     for j in 1:N
-        if any(isnan.(G_ensemble_full[:, j]))
+        if !all(isfinite.(G_ensemble_full[:, j]))
             G_pca[:, j] .= NaN
             continue
         end
-        # Denormalise PDF block and project to PCA space
-        pdf_j      = G_ensemble_full[1:n_pdf,     j] .* uncertainties_full[1:n_pdf]
+        pdf_j      = G_ensemble_full[1:n_pdf, j]
         pca_coords = vec(MultivariateStats.transform(pca_model, pdf_j))
-        # Denormalise dynamical stats
-        wt = G_ensemble_full[n_pdf + 1, j] * uncertainties_full[n_pdf + 1]
-        sd = G_ensemble_full[n_pdf + 2, j] * uncertainties_full[n_pdf + 2]
-        # Renormalise with PCA uncertainties
-        G_pca[1:n_pca,      j] = pca_coords[1:n_pca] ./ uncertainties_pca[1:n_pca]
-        G_pca[n_pca + 1, j]    = wt / uncertainties_pca[n_pca + 1]
-        G_pca[n_pca + 2, j]    = sd / uncertainties_pca[n_pca + 2]
+        G_pca[1:n_pca,   j] = pca_coords[1:n_pca]
+        G_pca[n_pca + 1, j] = G_ensemble_full[n_pdf + 1, j]
+        G_pca[n_pca + 2, j] = G_ensemble_full[n_pdf + 2, j]
     end
     return G_pca
 end
 
 # ============================================
 # NORMALIZATION UTILITIES
-# ============================================
-
-"""
-Normalize observations by their uncertainties
-"""
-function normalize_observations(y, uncertainties)
-    return y ./ uncertainties
-end
-
-"""
-Denormalize observations back to physical units
-"""
-function denormalize_observations(y_normalized, uncertainties)
-    return y_normalized .* uncertainties
-end
-
 # ============================================
 # JOB SUBMISSION USING RUNME
 # ============================================
@@ -482,13 +463,15 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
                         n_threshold=n_threshold
                     )
                     
-                    # Normalize by uncertainties
-                    G_ensemble[:, j] = normalize_observations(calibration_vector, uncertainties)
-                    
+                    # Physical units throughout -- observation uncertainty is carried
+                    # by obs_noise_cov (passed to EnsembleKalmanProcess), not baked
+                    # into the data.
+                    G_ensemble[:, j] = calibration_vector
+
                     if j % 10 == 0
                         println("    Processed $j/$N_ensemble outputs")
                     end
-                    
+
                 catch e
                     @warn "Failed to process member $(tracker.member_id): $e"
                     G_ensemble[:, j] .= NaN
@@ -505,66 +488,60 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
             n_failures += 1
         end
     end
-    
+
     if n_failures > max_failures_allowed
         @error "Too many failures: $n_failures/$N_ensemble (max allowed: $max_failures_allowed)"
         error("Iteration failed due to excessive failures")
     elseif n_failures > 0
         @warn "$n_failures/$N_ensemble members failed"
     end
-    
+
     println("  ✓ Results collected: $(N_ensemble - n_failures) successful")
-    
-    # Compute and report statistics (denormalize for reporting)
-    valid_members = [j for j in 1:N_ensemble if !any(isnan.(G_ensemble[:, j]))]
+
+    # Compute and report statistics -- G_ensemble/y_obs are already physical units.
+    # isfinite (not isnan): catches Inf as well as NaN.
+    valid_members = [j for j in 1:N_ensemble if all(isfinite.(G_ensemble[:, j]))]
     if !isempty(valid_members)
         n_pdf = length(pdf_grid)
         dx = step(pdf_grid)
-        
-        # Denormalize for physical interpretation
-        G_denorm = zeros(n_outputs, length(valid_members))
-        for (idx, j) in enumerate(valid_members)
-            G_denorm[:, idx] = denormalize_observations(G_ensemble[:, j], uncertainties)
-        end
-        
-        y_obs_denorm = denormalize_observations(y_obs, uncertainties)
-        
-        # PDF L2 distances (in physical units)
-        pdf_obs = y_obs_denorm[1:n_pdf]
-        l2_distances = [l2_distance(G_denorm[1:n_pdf, idx], pdf_obs, dx) for idx in 1:length(valid_members)]
-        
-        # Waiting times (in physical units)
-        waiting_times = G_denorm[n_pdf+1, :]
-        waiting_time_obs = y_obs_denorm[n_pdf+1]
-        
-        # Stadial durations (in physical units)
-        stadial_durations = G_denorm[n_pdf+2, :]
-        stadial_duration_obs = y_obs_denorm[n_pdf+2]
-        
+
+        pdf_obs = y_obs[1:n_pdf]
+        l2_distances = [l2_distance(G_ensemble[1:n_pdf, j], pdf_obs, dx) for j in valid_members]
+
+        waiting_times    = G_ensemble[n_pdf+1, valid_members]
+        waiting_time_obs = y_obs[n_pdf+1]
+
+        stadial_durations    = G_ensemble[n_pdf+2, valid_members]
+        stadial_duration_obs = y_obs[n_pdf+2]
+
         println("\n  PDF L2 distance statistics (physical units):")
         println("    Mean: $(round(mean(l2_distances), digits=6))")
         println("    Min:  $(round(minimum(l2_distances), digits=6))")
         println("    Max:  $(round(maximum(l2_distances), digits=6))")
         println("    Members within tolerance (< $PDF_TOLERANCE): $(sum(l2_distances .< PDF_TOLERANCE))/$(length(l2_distances))")
-        
+
         println("\n  Waiting time statistics (years):")
         println("    Target: $(round(waiting_time_obs, digits=1)) years")
         println("    Mean:   $(round(mean(waiting_times), digits=1)) years")
         println("    Std:    $(round(std(waiting_times), digits=1)) years")
         println("    Range:  [$(round(minimum(waiting_times), digits=1)), $(round(maximum(waiting_times), digits=1))] years")
-        
+
         println("\n  Stadial duration statistics (years):")
         println("    Target: $(round(stadial_duration_obs, digits=1)) years")
         println("    Mean:   $(round(mean(stadial_durations), digits=1)) years")
         println("    Std:    $(round(std(stadial_durations), digits=1)) years")
         println("    Range:  [$(round(minimum(stadial_durations), digits=1)), $(round(maximum(stadial_durations), digits=1))] years")
-        
-        println("\n  Normalized observation statistics (for EKI):")
-        println("    PDF components: $(round(mean(G_ensemble[1:n_pdf, valid_members]), digits=3)) ± $(round(std(G_ensemble[1:n_pdf, valid_members]), digits=3))")
-        println("    Waiting time: $(round(mean(G_ensemble[n_pdf+1, valid_members]), digits=3)) ± $(round(std(G_ensemble[n_pdf+1, valid_members]), digits=3))")
-        println("    Stadial duration: $(round(mean(G_ensemble[n_pdf+2, valid_members]), digits=3)) ± $(round(std(G_ensemble[n_pdf+2, valid_members]), digits=3))")
+
+        # Residuals normalised by observation uncertainty (diagnostic only -- the data
+        # stays in physical units; RMS ≈ 1 means ensemble spread matches the
+        # uncertainty assumed in obs_noise_cov).
+        resid = (G_ensemble[:, valid_members] .- y_obs) ./ uncertainties
+        println("\n  Normalised residual RMS (physical data vs. obs_noise_cov, ideally ≈ 1):")
+        println("    PDF components:    $(round(sqrt(mean(resid[1:n_pdf, :].^2)), digits=3))")
+        println("    Waiting time:      $(round(sqrt(mean(resid[n_pdf+1, :].^2)), digits=3))")
+        println("    Stadial duration:  $(round(sqrt(mean(resid[n_pdf+2, :].^2)), digits=3))")
     end
-    
+
     return G_ensemble
 end
 
@@ -594,8 +571,8 @@ function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid,
                     loess_span=loess_span,
                     n_threshold=n_threshold
                 )
-                G_ensemble[:, j] = normalize_observations(calibration_vector, uncertainties)
-                
+                G_ensemble[:, j] = calibration_vector  # physical units
+
                 if j % 10 == 0
                     println("    Processed $j/$N_ensemble outputs")
                 end
@@ -659,36 +636,34 @@ function save_iteration_results(iteration, params_i, G_ensemble, job_trackers,
                                y_obs_pca=nothing, uncertainties_pca=nothing,
                                iter_start_time=nothing)
     results_file = joinpath(output_dir, "iteration_$(iteration)_results.jld2")
-    
-    # Compute diagnostics for all valid members (in physical units)
+
+    # Compute diagnostics for all valid members. G_ensemble/y_obs are already physical
+    # units (isfinite, not isnan, to also catch Inf).
     dx = step(pdf_grid)
     n_pdf = length(pdf_grid)
-    
+
     l2_distances = Float64[]
     waiting_times = Float64[]
     stadial_durations = Float64[]
-    
-    y_obs_denorm = denormalize_observations(y_obs, uncertainties)
-    
+
     for j in 1:size(G_ensemble, 2)
-        if !any(isnan.(G_ensemble[:, j]))
-            G_denorm = denormalize_observations(G_ensemble[:, j], uncertainties)
-            push!(l2_distances, l2_distance(G_denorm[1:n_pdf], y_obs_denorm[1:n_pdf], dx))
-            push!(waiting_times, G_denorm[n_pdf+1])
-            push!(stadial_durations, G_denorm[n_pdf+2])
+        if all(isfinite.(G_ensemble[:, j]))
+            push!(l2_distances, l2_distance(G_ensemble[1:n_pdf, j], y_obs[1:n_pdf], dx))
+            push!(waiting_times, G_ensemble[n_pdf+1, j])
+            push!(stadial_durations, G_ensemble[n_pdf+2, j])
         else
             push!(l2_distances, NaN)
             push!(waiting_times, NaN)
             push!(stadial_durations, NaN)
         end
     end
-    
-    # Extract per-member PDFs in physical units (n_pdf × N_ensemble)
+
+    # Per-member PDFs, already physical units (n_pdf × N_ensemble)
     N_members = size(G_ensemble, 2)
     pdfs_physical = zeros(n_pdf, N_members)
     for j in 1:N_members
-        if !any(isnan.(G_ensemble[:, j]))
-            pdfs_physical[:, j] = G_ensemble[1:n_pdf, j] .* uncertainties[1:n_pdf]
+        if all(isfinite.(G_ensemble[:, j]))
+            pdfs_physical[:, j] = G_ensemble[1:n_pdf, j]
         else
             pdfs_physical[:, j] .= NaN
         end
@@ -708,13 +683,16 @@ function save_iteration_results(iteration, params_i, G_ensemble, job_trackers,
     iter_duration_seconds = isnothing(iter_start_time) ? NaN :
         Dates.value(now() - iter_start_time) / 1000.0
 
-    # PCA-mode: compute normalised residuals per component and print summary
+    # PCA-mode: compute normalised residuals per component and print summary.
+    # G_pca/y_obs_pca are physical units; divide by uncertainties_pca here to get the
+    # normalised (RMS ≈ 1 expected) residual, since the data itself is no longer
+    # pre-normalised the way it used to be.
     pca_residuals = nothing
     if !isnothing(G_pca) && !isnothing(y_obs_pca)
         n_obs  = size(G_pca, 1)
         n_pca  = n_obs - 2
-        valid  = [j for j in 1:size(G_pca, 2) if !any(isnan.(G_pca[:, j]))]
-        pca_residuals = G_pca[:, valid] .- y_obs_pca  # (n_obs × n_valid), already normalised
+        valid  = [j for j in 1:size(G_pca, 2) if all(isfinite.(G_pca[:, j]))]
+        pca_residuals = (G_pca[:, valid] .- y_obs_pca) ./ uncertainties_pca  # (n_obs × n_valid)
 
         labels = vcat(["PCA $k" for k in 1:n_pca], ["WaitingTime", "StadialDur"])
         mean_res = vec(mean(pca_residuals, dims=2))
@@ -1020,23 +998,22 @@ function run_climber_x_calibration(;
             block_analysis["sd_uncertainty"]
         )
 
-        # Normalize observations by uncertainties
-        y_obs = normalize_observations(y_obs_raw, uncertainties)
+        # Physical units throughout -- no data normalisation. Observation uncertainty
+        # is carried entirely by obs_noise_cov (Γ), matching how the emulator+MCMC
+        # approach's Gaussian likelihood works directly in physical units rather than
+        # pre-whitening the data (see gp_emulator.py: its StandardScaler is inverted
+        # before predictions ever reach the likelihood -- physical units all the way
+        # through the actual statistical step, which is what this now mirrors).
+        y_obs = y_obs_raw
 
         # Keep 102-dim copies — needed for PCA fitting and G projection in :pca mode
         y_obs_full         = y_obs
         uncertainties_full = uncertainties
 
-        println("\n  Target observations (normalized):")
-        println("    PDF range: [$(round(minimum(y_obs[1:pdf_grid_points]), digits=3)), $(round(maximum(y_obs[1:pdf_grid_points]), digits=3))]")
-        println("    Waiting time: $(round(y_obs[pdf_grid_points+1], digits=3))")
-        println("    Stadial duration: $(round(y_obs[pdf_grid_points+2], digits=3))")
-        
-        # Use unit observation covariance (since observations are normalized)
-        obs_noise_cov = Diagonal(ones(length(y_obs)))
-        
-        println("\n  Using unit observation covariance (normalized observations)")
-        
+        obs_noise_cov = Diagonal(uncertainties.^2)
+
+        println("\n  Using real observation covariance (physical units, diag(uncertainties.^2))")
+
         println("\nInitializing EKI process...")
         initial_ensemble = construct_initial_ensemble(prior, N_ensemble)
         eks_process = Sampler(prior)
@@ -1088,8 +1065,8 @@ function run_climber_x_calibration(;
             "stadial_duration_uncertainty" => STADIAL_DURATION_UNCERTAINTY,
             "default_run" => DEFAULT_RUN_OUTPUT,
             "distance_metric" => "L2",
-            "observations" => "PDF + waiting_time + stadial_duration (normalized)",
-            "normalization" => "by_uncertainty"
+            "observations" => "PDF + waiting_time + stadial_duration (physical units)",
+            "normalization" => "none -- obs_noise_cov = diag(uncertainties.^2)"
         )
         
         save_checkpoint(0, eksobj, prior, param_history,
@@ -1111,8 +1088,8 @@ function run_climber_x_calibration(;
         )
     end
 
-    obs_noise_cov = Diagonal(ones(length(y_obs)))
-    
+    obs_noise_cov = Diagonal(uncertainties.^2)
+
     metadata = Dict(
         "start_time" => now(),
         "N_iterations" => N_iterations,
@@ -1124,8 +1101,8 @@ function run_climber_x_calibration(;
         "stadial_duration_uncertainty" => STADIAL_DURATION_UNCERTAINTY,
         "default_run" => DEFAULT_RUN_OUTPUT,
         "distance_metric" => "L2",
-        "observations" => "PDF + waiting_time + stadial_duration (normalized)",
-        "normalization" => "by_uncertainty"
+        "observations" => "PDF + waiting_time + stadial_duration (physical units)",
+        "normalization" => "none -- obs_noise_cov = diag(uncertainties.^2)"
     )
     
     # Main iteration loop
@@ -1207,9 +1184,8 @@ function run_climber_x_calibration(;
         if calibration_mode == :pca
             n_pdf   = length(pdf_grid)
             valid_j = [j for j in 1:size(G_ensemble, 2)
-                       if !any(isnan.(G_ensemble[:, j]))]
-            pdf_matrix = hcat([G_ensemble[1:n_pdf, j] .* uncertainties_full[1:n_pdf]
-                               for j in valid_j]...)
+                       if all(isfinite.(G_ensemble[:, j]))]
+            pdf_matrix = hcat([G_ensemble[1:n_pdf, j] for j in valid_j]...)  # physical units
             if isnothing(pca_model)
                 println("\n  Fitting PCA on $(length(valid_j)) ensemble PDFs (iteration $i — basis fixed for all subsequent iterations)...")
                 pca_model = fit_pca_from_ensemble(pdf_matrix; n_components=N_PCA_COMPONENTS)
@@ -1230,36 +1206,37 @@ function run_climber_x_calibration(;
                 block_analysis["wt_uncertainty"],
                 block_analysis["sd_uncertainty"]
             )
+            # Floor near-zero uncertainties -- same rationale as pdf_uncertainty in
+            # estimate_block_uncertainties: a real Γ diagonal shouldn't have exact
+            # zeros, and a near-zero PCA-component variance is exactly the kind of
+            # thing a small block count can produce by chance.
+            uncertainties = max.(uncertainties, 1e-3 * maximum(uncertainties))
 
-            # Project default-run observations to current PCA space
-            pdf_obs_phys = y_obs_full[1:n_pdf]    .* uncertainties_full[1:n_pdf]
-            wt_phys      = y_obs_full[n_pdf + 1]   * uncertainties_full[n_pdf + 1]
-            sd_phys      = y_obs_full[n_pdf + 2]   * uncertainties_full[n_pdf + 2]
+            # Project default-run observations to current PCA space -- physical units
+            # throughout (y_obs_full is already physical).
+            pdf_obs_phys = y_obs_full[1:n_pdf]
+            wt_phys      = y_obs_full[n_pdf + 1]
+            sd_phys      = y_obs_full[n_pdf + 2]
             pca_obs      = vec(MultivariateStats.transform(pca_model, pdf_obs_phys))
-            y_obs = vcat(
-                pca_obs[1:N_PCA_COMPONENTS] ./ uncertainties[1:N_PCA_COMPONENTS],
-                wt_phys / uncertainties[N_PCA_COMPONENTS + 1],
-                sd_phys / uncertainties[N_PCA_COMPONENTS + 2]
-            )
+            y_obs = vcat(pca_obs[1:N_PCA_COMPONENTS], wt_phys, sd_phys)
 
-            println("\n  PCA target observations (normalised):")
+            println("\n  PCA target observations (physical units):")
             for k in 1:N_PCA_COMPONENTS
-                println("    PCA component $k: $(round(y_obs[k], digits=3))")
+                println("    PCA component $k: $(round(y_obs[k], digits=3)) ± $(round(uncertainties[k], digits=3))")
             end
-            println("    Waiting time:     $(round(y_obs[N_PCA_COMPONENTS+1], digits=3))")
-            println("    Stadial duration: $(round(y_obs[N_PCA_COMPONENTS+2], digits=3))")
+            println("    Waiting time:     $(round(y_obs[N_PCA_COMPONENTS+1], digits=1)) ± $(round(uncertainties[N_PCA_COMPONENTS+1], digits=1)) yr")
+            println("    Stadial duration: $(round(y_obs[N_PCA_COMPONENTS+2], digits=1)) ± $(round(uncertainties[N_PCA_COMPONENTS+2], digits=1)) yr")
 
             # Reinitialise EKS with current ensemble state and updated 7-dim observations.
             # EKS is memoryless between steps (only uses current ensemble), so this is exact.
             u_current     = get_u_final(eksobj)
-            obs_noise_cov = Diagonal(ones(N_PCA_COMPONENTS + 2))
+            obs_noise_cov = Diagonal(uncertainties.^2)
             eksobj = EnsembleKalmanProcess(u_current, y_obs, obs_noise_cov,
                                            Sampler(prior); verbose=true)
             println("  ✓ EKS reinitialised with $(N_PCA_COMPONENTS + 2)-dim PCA observations")
 
             # Project full G_ensemble to PCA space for the EKI update
-            G_for_update = project_g_to_pca(G_ensemble, pca_model, n_pdf,
-                                             uncertainties_full, uncertainties)
+            G_for_update = project_g_to_pca(G_ensemble, pca_model, n_pdf)
         else
             # :pdf mode — use full 102-dim G directly
             G_for_update = G_ensemble
@@ -1355,25 +1332,24 @@ function run_climber_x_calibration(;
     
     if !isempty(final_pdfs)
         dx = step(pdf_grid)
-        y_obs_denorm = denormalize_observations(y_obs_full, uncertainties_full)
-        pdf_obs = y_obs_denorm[1:n_pdf]
-        
+        pdf_obs = y_obs_full[1:n_pdf]  # already physical units
+
         l2_distances = [l2_distance(pdf, pdf_obs, dx) for pdf in final_pdfs]
-        
+
         println("\nFinal PDF matching performance:")
         println("  L2 distance - Mean: $(round(mean(l2_distances), digits=6))")
         println("  L2 distance - Min:  $(round(minimum(l2_distances), digits=6))")
         println("  L2 distance - Max:  $(round(maximum(l2_distances), digits=6))")
         println("  Members within tolerance (< $PDF_TOLERANCE): $(sum(l2_distances .< PDF_TOLERANCE))/$(length(l2_distances))")
-        
+
         println("\nFinal waiting time performance:")
-        println("  Target: $(round(y_obs_denorm[n_pdf+1], digits=1)) years")
+        println("  Target: $(round(y_obs_full[n_pdf+1], digits=1)) years")
         println("  Mean:   $(round(mean(final_waiting_times), digits=1)) years")
         println("  Std:    $(round(std(final_waiting_times), digits=1)) years")
         println("  Range:  [$(round(minimum(final_waiting_times), digits=1)), $(round(maximum(final_waiting_times), digits=1))] years")
-        
+
         println("\nFinal stadial duration performance:")
-        println("  Target: $(round(y_obs_denorm[n_pdf+2], digits=1)) years")
+        println("  Target: $(round(y_obs_full[n_pdf+2], digits=1)) years")
         println("  Mean:   $(round(mean(final_stadial_durations), digits=1)) years")
         println("  Std:    $(round(std(final_stadial_durations), digits=1)) years")
         println("  Range:  [$(round(minimum(final_stadial_durations), digits=1)), $(round(maximum(final_stadial_durations), digits=1))] years")

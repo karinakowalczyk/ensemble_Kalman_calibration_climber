@@ -539,11 +539,25 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
 
     # Uncertainties: std across valid blocks
     # Since block_size ≈ calibration run length, no sqrt(N) scaling is needed.
-    pdf_uncertainty = vec(std(block_pdfs[:, valid_blocks], dims=2))
+    #
+    # Floor near-zero grid-point uncertainties: the KDE PDF evaluates to exact 0.0 far
+    # from where a block's data actually sits (e.g. the sparse high-Sv tail), so every
+    # block can independently land on exactly 0.0 at some grid point, giving
+    # pdf_uncertainty=0.0 there. That zero becomes obs_noise_cov's diagonal entry for
+    # that component -- a real covariance shouldn't have exact zeros (numerically
+    # ill-conditioned, and a "zero uncertainty" claim is never actually justified from
+    # a finite sample). Floor relative to the largest per-point uncertainty so it
+    # self-scales with the PDF's magnitude regardless of grid range/resolution.
+    raw_pdf_uncertainty = vec(std(block_pdfs[:, valid_blocks], dims=2))
+    n_floored = sum(raw_pdf_uncertainty .< 1e-3 * maximum(raw_pdf_uncertainty))
+    pdf_uncertainty = max.(raw_pdf_uncertainty, 1e-3 * maximum(raw_pdf_uncertainty))
     wt_uncertainty  = std(block_wts[valid_blocks])
     sd_uncertainty  = std(block_sds[valid_blocks])
 
     println("\n  Derived uncertainties (std across $n_valid valid blocks):")
+    if n_floored > 0
+        println("    WARNING: floored $n_floored/$(length(raw_pdf_uncertainty)) near-zero PDF grid-point uncertainties")
+    end
     println("    PDF mean per-grid-point std: $(round(mean(pdf_uncertainty), digits=6))")
     println("    PDF max  per-grid-point std: $(round(maximum(pdf_uncertainty), digits=6))")
     println("    Waiting time std:            $(round(wt_uncertainty, digits=1)) years")
