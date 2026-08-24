@@ -144,7 +144,9 @@ function wait_for_iteration_completion(job_trackers;
                                        check_interval_minutes=30,
                                        max_wait_days=10,
                                        output_dir=nothing,
-                                       max_unknown_checks=3)
+                                       max_unknown_checks=3,
+                                       max_completed_invalid_checks=2,
+                                       expected_nyears=nothing)
 
     println("\n  Waiting for jobs to complete...")
     println("  Checking every $check_interval_minutes minutes")
@@ -153,13 +155,21 @@ function wait_for_iteration_completion(job_trackers;
     max_wait = Dates.Day(max_wait_days)
     # Per-tracker count of consecutive :unknown SLURM responses
     unknown_counts = Dict(tracker.job_id => 0 for tracker in job_trackers)
+    # Per-tracker count of consecutive "SLURM completed but output file still
+    # invalid" observations -- gives a real filesystem write/flush lag a couple
+    # of poll cycles to resolve before treating it as a genuine failure.
+    completed_invalid_counts = Dict(tracker.job_id => 0 for tracker in job_trackers)
 
     while true
         for tracker in job_trackers
             if tracker.status in [:submitted, :running]
                 # Ground-truth check: valid output file means the run finished,
-                # regardless of what SLURM reports.
-                if validate_climber_output_file(tracker.output_file)[1]
+                # regardless of what SLURM reports. expected_nyears makes this a
+                # real completion check (time reaches the full run length) rather
+                # than just "file exists with the right variables" -- CLIMBER-X
+                # writes ocn_ts.nc incrementally, so without it a still-running
+                # job's partial file passes just as easily as a finished one.
+                if validate_climber_output_file(tracker.output_file; expected_nyears=expected_nyears)[1]
                     tracker.status = :completed
                     tracker.completion_time = now()
                     println("    Member $(tracker.member_id): output file valid — marking completed")
@@ -169,11 +179,20 @@ function wait_for_iteration_completion(job_trackers;
                 new_status = check_job_status(tracker.job_id, max_retries=3, initial_delay=5)
 
                 if new_status == :completed
-                    # SLURM says COMPLETED but the file check above failed —
-                    # the run likely diverged and exited cleanly without producing output.
-                    tracker.status = :failed
-                    tracker.completion_time = now()
-                    @warn "Member $(tracker.member_id): SLURM COMPLETED but output invalid — treating as failed"
+                    # SLURM says COMPLETED but the file check above failed. Could be
+                    # a genuinely diverged run that exited without producing full
+                    # output, or just a filesystem write/flush lag right at the tail
+                    # end of a real completion (process exits before the last write
+                    # is visible on shared storage). Give it a couple more poll
+                    # cycles before treating it as a real failure.
+                    completed_invalid_counts[tracker.job_id] += 1
+                    if completed_invalid_counts[tracker.job_id] >= max_completed_invalid_checks
+                        tracker.status = :failed
+                        tracker.completion_time = now()
+                        @warn "Member $(tracker.member_id): SLURM COMPLETED but output still invalid after $max_completed_invalid_checks checks — treating as failed"
+                    else
+                        @warn "Member $(tracker.member_id): SLURM COMPLETED but output not yet valid (check $(completed_invalid_counts[tracker.job_id])/$max_completed_invalid_checks) — will recheck next cycle"
+                    end
 
                 elseif new_status in [:failed, :timeout, :oom, :cancelled]
                     tracker.status = new_status

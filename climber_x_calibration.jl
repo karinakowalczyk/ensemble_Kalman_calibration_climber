@@ -110,7 +110,26 @@ end
 
 # PDF calibration settings
 const PDF_GRID_POINTS = 100
-const PDF_TOLERANCE = 0.03  # L2 distance tolerance for PDF (equivalent to ~0.01 supremum)
+
+"""
+PDF-matching tolerance (L2 distance) for the "members within tolerance" diagnostic
+-- purely a reporting aid, never used in the EKI/EKS update itself (that only
+needs y_obs and obs_noise_cov). Derived from the default run's own block-to-block
+PDF variability: how different the target looks from different chunks of itself,
+due to internal variability alone. No real ensemble member could beat that noise
+floor even with a perfect parameter match, since it has its own finite-length PDF
+estimation noise on top. Combines the two (assumed similarly-sized, independent)
+noise sources in quadrature: √2 × the target's own per-grid-point uncertainty,
+in the L2 sense.
+"""
+function compute_pdf_tolerance(block_analysis, pdf_grid)
+    # pdf_grid[2]-pdf_grid[1] rather than step(pdf_grid): pdf_grid is a proper
+    # range on a fresh run, but a plain Vector after loading from a checkpoint
+    # (saved via collect(pdf_grid)), and step() only works on the former.
+    dx = pdf_grid[2] - pdf_grid[1]
+    pdf_uncertainty = block_analysis["pdf_uncertainty"]
+    return sqrt(2) * sqrt(sum(pdf_uncertainty .^ 2) * dx)
+end
 
 # Dynamical statistics uncertainties (from your original setup)
 const WAITING_TIME_UNCERTAINTY = 200  # years
@@ -296,31 +315,42 @@ end
 # ============================================
 
 """
-Validate CLIMBER-X output file
+Validate CLIMBER-X output file.
+
+If `expected_nyears` is given, also checks that `time` actually reaches that
+length -- file size and variable presence alone are NOT enough to detect
+completion, since CLIMBER-X writes ocn_ts.nc incrementally as the simulation
+runs. A file a few hundred years into a 7000-year run already clears the
+size/variable bar, so without this check a still-running job gets marked
+:completed and processed on truncated, mid-simulation data.
 """
-function validate_climber_output_file(output_file; min_size_bytes=100000)
+function validate_climber_output_file(output_file; min_size_bytes=100000, expected_nyears=nothing)
     if !isfile(output_file)
         return false, "File does not exist"
     end
-    
+
     file_size = filesize(output_file)
     if file_size < min_size_bytes
         return false, "File too small: $(file_size) bytes"
     end
-    
+
     try
         ds = NCDataset(output_file)
         has_amoc = haskey(ds, "amoc26N")
         has_time = haskey(ds, "time")
+        n_years_written = has_time ? length(ds["time"]) : 0
         close(ds)
-        
+
         if !has_amoc
             return false, "Missing amoc26N variable"
         end
         if !has_time
             return false, "Missing time variable"
         end
-        
+        if expected_nyears !== nothing && n_years_written < expected_nyears
+            return false, "Incomplete: $(n_years_written)/$(expected_nyears) years written"
+        end
+
         return true, "Valid"
     catch e
         return false, "Cannot read NetCDF: $e"
@@ -436,7 +466,7 @@ end
 """
 Collect results from CLIMBER-X iteration using PDF + dynamical statistics
 """
-function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02, n_threshold::Int=1)
+function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02, n_threshold::Int=1, expected_nyears=nothing, pdf_tolerance)
     N_ensemble = length(job_trackers)
     n_outputs = length(y_obs)  # PDF grid points + 2 dynamical stats
     G_ensemble = zeros(n_outputs, N_ensemble)
@@ -447,8 +477,8 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
     
     for (j, tracker) in enumerate(job_trackers)
         if tracker.status == :completed
-            is_valid, msg = validate_climber_output_file(tracker.output_file)
-            
+            is_valid, msg = validate_climber_output_file(tracker.output_file; expected_nyears=expected_nyears)
+
             if is_valid
                 try
                     # Process output: get PDF + stats
@@ -518,7 +548,7 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
         println("    Mean: $(round(mean(l2_distances), digits=6))")
         println("    Min:  $(round(minimum(l2_distances), digits=6))")
         println("    Max:  $(round(maximum(l2_distances), digits=6))")
-        println("    Members within tolerance (< $PDF_TOLERANCE): $(sum(l2_distances .< PDF_TOLERANCE))/$(length(l2_distances))")
+        println("    Members within tolerance (< $pdf_tolerance): $(sum(l2_distances .< pdf_tolerance))/$(length(l2_distances))")
 
         println("\n  Waiting time statistics (years):")
         println("    Target: $(round(waiting_time_obs, digits=1)) years")
@@ -548,17 +578,17 @@ end
 """
 Collect results from existing output files (for resuming)
 """
-function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02, n_threshold::Int=1)
+function collect_results_from_files(output_dir, iteration, N_ensemble, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02, n_threshold::Int=1, expected_nyears=nothing)
     n_outputs = length(y_obs)
     G_ensemble = zeros(n_outputs, N_ensemble)
     n_failures = 0
-    
+
     println("\n  Collecting results from existing files for iteration $iteration...")
-    
+
     for j in 1:N_ensemble
         output_file = joinpath(output_dir, "iter_$(iteration)", "member_$(j)", "ocn_ts.nc")
-        is_valid, msg = validate_climber_output_file(output_file)
-        
+        is_valid, msg = validate_climber_output_file(output_file; expected_nyears=expected_nyears)
+
         if is_valid
             try
                 calibration_vector, _ = process_climber_output_with_stats(
@@ -789,10 +819,10 @@ function run_climber_x_calibration(;
     println("="^80)
     println("Parameters: $(length(PARAM_NAMES)) ocean parameters")
     println("Observations:")
-    println("  - PDF with $pdf_grid_points grid points (L2 tolerance: $PDF_TOLERANCE)")
+    println("  - PDF with $pdf_grid_points grid points (L2 tolerance: derived from default-run block variability, see below)")
     println("  - Average waiting time (σ = $WAITING_TIME_UNCERTAINTY years)")
     println("  - Average stadial duration (σ = $STADIAL_DURATION_UNCERTAINTY years)")
-    println("  - All observations normalized by uncertainties for balanced fitting")
+    println("  - Physical units throughout; observation uncertainty carried by obs_noise_cov")
     println("DO detection: method=$do_method  cv=$do_crossing_value  spinup=$(spinup_years > 0 ? "$(spinup_years) yr" : "$(round(Int, ens_spinup_fraction*nyears)) yr ($(ens_spinup_fraction*100)%)")")
     println("Ensemble size: $N_ensemble")
     println("Iterations: $N_iterations")
@@ -991,6 +1021,9 @@ function run_climber_x_calibration(;
             save_dir=output_dir
         )
 
+        pdf_tolerance = compute_pdf_tolerance(block_analysis, pdf_grid)
+        println("  PDF tolerance (from block-to-block variability): $(round(pdf_tolerance, digits=4))")
+
         # Uncertainty vector: per-grid-point PDF std + scalar stat stds
         uncertainties = vcat(
             block_analysis["pdf_uncertainty"],
@@ -1060,7 +1093,7 @@ function run_climber_x_calibration(;
             "N_ensemble" => N_ensemble,
             "param_names" => PARAM_NAMES,
             "pdf_grid_points" => pdf_grid_points,
-            "pdf_tolerance" => PDF_TOLERANCE,
+            "pdf_tolerance" => pdf_tolerance,
             "waiting_time_uncertainty" => WAITING_TIME_UNCERTAINTY,
             "stadial_duration_uncertainty" => STADIAL_DURATION_UNCERTAINTY,
             "default_run" => DEFAULT_RUN_OUTPUT,
@@ -1086,6 +1119,8 @@ function run_climber_x_calibration(;
             n_threshold=n_threshold,
             save_dir=output_dir
         )
+        pdf_tolerance = compute_pdf_tolerance(block_analysis, pdf_grid)
+        println("  PDF tolerance (from block-to-block variability): $(round(pdf_tolerance, digits=4))")
     end
 
     obs_noise_cov = Diagonal(uncertainties.^2)
@@ -1096,7 +1131,7 @@ function run_climber_x_calibration(;
         "N_ensemble" => N_ensemble,
         "param_names" => PARAM_NAMES,
         "pdf_grid_points" => pdf_grid_points,
-        "pdf_tolerance" => PDF_TOLERANCE,
+        "pdf_tolerance" => pdf_tolerance,
         "waiting_time_uncertainty" => WAITING_TIME_UNCERTAINTY,
         "stadial_duration_uncertainty" => STADIAL_DURATION_UNCERTAINTY,
         "default_run" => DEFAULT_RUN_OUTPUT,
@@ -1124,13 +1159,16 @@ function run_climber_x_calibration(;
             end
         end
         
-        # Check if iteration already has completed outputs
+        # Check if iteration already has completed outputs. expected_nyears=nyears
+        # so a still-running job's partial file (which otherwise looks "valid" --
+        # right size, right variables, just not enough years yet) doesn't get
+        # mistaken for a finished one and skip-reused.
         iter_dir = joinpath(output_dir, "iter_$(i)")
         all_outputs_exist = true
         if isdir(iter_dir)
             for j in 1:N_ensemble
                 output_file = joinpath(iter_dir, "member_$(j)", "ocn_ts.nc")
-                if !validate_climber_output_file(output_file)[1]
+                if !validate_climber_output_file(output_file; expected_nyears=nyears)[1]
                     all_outputs_exist = false
                     break
                 end
@@ -1162,14 +1200,15 @@ function run_climber_x_calibration(;
                 job_trackers;
                 check_interval_minutes=check_interval_minutes,
                 max_wait_days=max_wait_days,
-                output_dir=output_dir
+                output_dir=output_dir,
+                expected_nyears=nyears
             )
-            
+
             if result == :timeout
                 error("Iteration $i timed out")
             end
         end
-        
+
         # Collect results — always in full 102-dim space (PDF + 2 stats)
         G_ensemble = collect_climber_iteration_results(job_trackers, pdf_grid,
                                                        y_obs_full, uncertainties_full,
@@ -1178,7 +1217,9 @@ function run_climber_x_calibration(;
                                                        do_method=do_method,
                                                        loess_span=loess_span,
                                                        ens_spinup_fraction=ens_spinup_fraction,
-                                                       n_threshold=n_threshold)
+                                                       n_threshold=n_threshold,
+                                                       expected_nyears=nyears,
+                                                       pdf_tolerance=pdf_tolerance)
 
         # ── PCA mode: refit PCA on current ensemble, then project ───────────
         if calibration_mode == :pca
@@ -1308,7 +1349,7 @@ function run_climber_x_calibration(;
     
     for j in 1:N_ensemble
         output_file = joinpath(output_dir, "iter_$(N_iterations)", "member_$(j)", "ocn_ts.nc")
-        if isfile(output_file) && validate_climber_output_file(output_file)[1]
+        if isfile(output_file) && validate_climber_output_file(output_file; expected_nyears=nyears)[1]
             try
                 calibration_vector, _ = process_climber_output_with_stats(
                     output_file, pdf_grid,
@@ -1340,7 +1381,7 @@ function run_climber_x_calibration(;
         println("  L2 distance - Mean: $(round(mean(l2_distances), digits=6))")
         println("  L2 distance - Min:  $(round(minimum(l2_distances), digits=6))")
         println("  L2 distance - Max:  $(round(maximum(l2_distances), digits=6))")
-        println("  Members within tolerance (< $PDF_TOLERANCE): $(sum(l2_distances .< PDF_TOLERANCE))/$(length(l2_distances))")
+        println("  Members within tolerance (< $pdf_tolerance): $(sum(l2_distances .< pdf_tolerance))/$(length(l2_distances))")
 
         println("\nFinal waiting time performance:")
         println("  Target: $(round(y_obs_full[n_pdf+1], digits=1)) years")
@@ -1363,7 +1404,7 @@ end
 # ============================================
 
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
-    N_iterations=3,
+    N_iterations=2,
     N_ensemble=60,
     output_dir="/p/tmp/karinako/eki_calibration_test/output",
     work_dir="/p/tmp/karinako/eki_calibration_test/working",
@@ -1375,5 +1416,9 @@ eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibra
     do_method="loess",
     loess_span=0.25,
     spinup_years=1000,
-    n_threshold=1          # min n_do_events required for do_variability=true (matches summary_stats.py)
+    n_threshold=2          # min n_do_events required for do_variability=true.
+                           # 1 event gives no measurable waiting time (needs >=2 to get
+                           # a gap between onsets), so avg_waiting_time=0.0 would mean
+                           # both "no DO activity" and "exactly 1 event" -- same sentinel,
+                           # ambiguous. >=2 events required before do_variability=true.
 )
