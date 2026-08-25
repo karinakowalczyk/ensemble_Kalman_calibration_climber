@@ -1,3 +1,10 @@
+# Disable HDF5's OS-level file locking before NCDatasets/HDF5 ever loads a file --
+# shared HPC filesystems (NFS, Lustre, GPFS) frequently don't support it reliably,
+# which can make NCDataset(...) fail to open a file that's actually complete and
+# fine, especially right around when the writing process (CLIMBER-X) is finishing
+# up. Must be set before any file gets opened, ideally before HDF5 initializes.
+ENV["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
 using EnsembleKalmanProcesses
 using EnsembleKalmanProcesses.ParameterDistributions
 using LinearAlgebra
@@ -1411,10 +1418,10 @@ eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibra
     check_interval_minutes=30,
     max_wait_days=10,
     pdf_grid_points=100,
-    nyears=7000,
+    nyears=5000,
     do_crossing_value=5.0,
     do_method="loess",
-    loess_span=0.25,
+    loess_span=0.375, # 0.25,
     spinup_years=1000,
     n_threshold=2          # min n_do_events required for do_variability=true.
                            # 1 event gives no measurable waiting time (needs >=2 to get
