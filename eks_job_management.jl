@@ -138,22 +138,66 @@ function check_disk_space(path; min_gb_required=100, warn_gb=200)
 end
 
 """
-Wait for all jobs in an iteration to complete
+Resubmit a failed/stalled member's job, in place on its tracker.
+
+`resubmit_fn(member_id) -> (new_job_id, new_output_file)` does the actual
+submission (CLIMBER-specific, supplied by the caller); this function just
+owns the retry bookkeeping and tracker mutation that's common to every kind
+of failure (stalled output, SLURM failure/timeout/oom, persistently unknown
+status). Returns `true` if a resubmission was issued, `false` if the member
+was instead marked permanently `:failed` (no resubmit_fn given, or retries
+exhausted).
 """
+function attempt_resubmit!(tracker, reason, retry_counts, resubmit_fn, max_retries_per_member)
+    if resubmit_fn === nothing || retry_counts[tracker.member_id] >= max_retries_per_member
+        tracker.status = :failed
+        tracker.completion_time = now()
+        @warn "Member $(tracker.member_id): $reason — giving up (retries: $(retry_counts[tracker.member_id])/$max_retries_per_member)"
+        return false
+    end
+
+    retry_counts[tracker.member_id] += 1
+    # Clear the stale/partial output so a fresh run starts clean and the
+    # year-count staleness check next cycle can't be confused by leftover
+    # data from the crashed attempt.
+    stale_dir = dirname(tracker.output_file)
+    isdir(stale_dir) && rm(stale_dir; recursive=true, force=true)
+
+    new_job_id, new_output_file = resubmit_fn(tracker.member_id)
+    tracker.job_id = new_job_id
+    tracker.output_file = new_output_file
+    tracker.status = :submitted
+    tracker.submit_time = now()
+    tracker.completion_time = nothing
+    @warn "Member $(tracker.member_id): $reason — resubmitted as job $new_job_id (attempt $(retry_counts[tracker.member_id])/$max_retries_per_member)"
+    return true
+end
+
 function wait_for_iteration_completion(job_trackers;
                                        check_interval_minutes=30,
                                        max_wait_days=10,
                                        output_dir=nothing,
                                        max_unknown_checks=3,
-                                       expected_nyears=nothing)
+                                       expected_nyears=nothing,
+                                       resubmit_fn=nothing,
+                                       max_retries_per_member=2)
 
     println("\n  Waiting for jobs to complete...")
     println("  Checking every $check_interval_minutes minutes")
 
     start_time = now()
     max_wait = Dates.Day(max_wait_days)
-    # Per-tracker count of consecutive :unknown SLURM responses
-    unknown_counts = Dict(tracker.job_id => 0 for tracker in job_trackers)
+    # Keyed by member_id (not job_id): a resubmission gives a member a new
+    # job_id, so job_id-keyed bookkeeping would silently reset/orphan itself
+    # across a retry.
+    unknown_counts = Dict(tracker.member_id => 0 for tracker in job_trackers)
+    # Year-count last seen while SLURM already reported :completed -- nothing
+    # (not yet observed) vs an actual count. Once SLURM confirms the writing
+    # process has exited, an unchanged count between two checks proves the
+    # run stalled/diverged early (nothing left alive to write more), rather
+    # than just being a transient filesystem write/flush lag.
+    last_years_written = Dict{Int, Union{Int, Nothing}}(tracker.member_id => nothing for tracker in job_trackers)
+    retry_counts = Dict(tracker.member_id => 0 for tracker in job_trackers)
 
     while true
         for tracker in job_trackers
@@ -165,8 +209,9 @@ function wait_for_iteration_completion(job_trackers;
                 # of a job that exited "successfully" without actually finishing the
                 # real simulation (e.g. silent early divergence). If the file isn't
                 # valid yet, we just leave the tracker as-is and let the next poll
-                # cycle retry -- no separate grace-period counter needed; max_wait_days
-                # is already the natural backstop for something that never resolves.
+                # cycle retry; max_wait_days remains the overall backstop, but the
+                # year-count comparison below usually catches a genuinely stalled
+                # run much sooner than that.
                 new_status = check_job_status(tracker.job_id, max_retries=3, initial_delay=5)
 
                 if new_status == :completed
@@ -176,23 +221,36 @@ function wait_for_iteration_completion(job_trackers;
                         tracker.completion_time = now()
                         println("    Member $(tracker.member_id): SLURM completed and output valid")
                     else
-                        @warn "Member $(tracker.member_id): SLURM completed but output not yet valid ($valid_msg) — will recheck next cycle"
+                        n_years = get_n_years_written(tracker.output_file)
+                        prev_years = last_years_written[tracker.member_id]
+                        if n_years >= 0 && prev_years !== nothing && n_years == prev_years
+                            attempt_resubmit!(tracker, "SLURM completed, output stuck at $n_years years (unchanged since last check)",
+                                               retry_counts, resubmit_fn, max_retries_per_member)
+                            last_years_written[tracker.member_id] = nothing
+                            unknown_counts[tracker.member_id] = 0
+                        else
+                            if n_years >= 0
+                                last_years_written[tracker.member_id] = n_years
+                            end
+                            @warn "Member $(tracker.member_id): SLURM completed but output not yet valid ($valid_msg) — will recheck next cycle"
+                        end
                     end
 
                 elseif new_status in [:failed, :timeout, :oom, :cancelled]
-                    tracker.status = new_status
-                    tracker.completion_time = now()
-                    @warn "Member $(tracker.member_id) SLURM status: $new_status"
+                    attempt_resubmit!(tracker, "SLURM status: $new_status", retry_counts, resubmit_fn, max_retries_per_member)
+                    last_years_written[tracker.member_id] = nothing
+                    unknown_counts[tracker.member_id] = 0
 
                 elseif new_status == :running && tracker.status == :submitted
                     tracker.status = :running
 
                 elseif new_status == :unknown
-                    unknown_counts[tracker.job_id] += 1
-                    if unknown_counts[tracker.job_id] >= max_unknown_checks
-                        tracker.status = :failed
-                        tracker.completion_time = now()
-                        @warn "Member $(tracker.member_id): SLURM status unknown for $max_unknown_checks consecutive checks — treating as failed (likely diverged)"
+                    unknown_counts[tracker.member_id] += 1
+                    if unknown_counts[tracker.member_id] >= max_unknown_checks
+                        attempt_resubmit!(tracker, "SLURM status unknown for $max_unknown_checks consecutive checks (likely diverged)",
+                                           retry_counts, resubmit_fn, max_retries_per_member)
+                        last_years_written[tracker.member_id] = nothing
+                        unknown_counts[tracker.member_id] = 0
                     end
                 end
             end

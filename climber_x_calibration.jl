@@ -243,6 +243,29 @@ function submit_climber_job_with_runme(iteration, member_id, params_dict, output
 end
 
 """
+Build the CLIMBER-X parameter dict (physical units: ocn.* calibration params +
+fixed params + nyears) for one ensemble member's [0,1]-normalised parameter
+column. Shared by the initial per-iteration submission and by resubmission
+of an individual failed/stalled member, so both submit identical params.
+"""
+function build_member_params_dict(params_i_norm_col, nyears)
+    params_dict = Dict{String, Any}()
+
+    # params_i_norm_col is in [0,1] normalised space; denormalise to physical units for CLIMBER.
+    for (idx, name) in enumerate(PARAM_NAMES)
+        p_norm = clamp(params_i_norm_col[idx], 0.0, 1.0)
+        params_dict["ocn.$(name)"] = denormalise_param(p_norm, name)
+    end
+
+    for (key, val) in CLIMBER_FIXED_PARAMS
+        params_dict[key] = val
+    end
+    params_dict["ctl.nyears"] = nyears
+
+    return params_dict
+end
+
+"""
 Submit CLIMBER-X jobs for one iteration using runme
 """
 function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir; nyears=7000)
@@ -252,31 +275,17 @@ function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir
     println("\n  Submitting $N_ensemble CLIMBER-X jobs for iteration $iteration...")
     println("  Using runme -rs to submit jobs")
     println("  Run length: $nyears years")
-    
+
     # Check disk space
     has_space, available_gb = check_disk_space(output_dir, min_gb_required=100, warn_gb=500)
     if !has_space
         error("Insufficient disk space")
     end
-    
+
     # Submit jobs
     for j in 1:N_ensemble
-        # Build parameter dictionary for this member
-        params_dict = Dict{String, Any}()
-        
-        # Add calibration parameters (with ocn. prefix).
-        # params_i is in [0,1] normalised space; denormalise to physical units for CLIMBER.
-        for (idx, name) in enumerate(PARAM_NAMES)
-            p_norm = clamp(params_i[idx, j], 0.0, 1.0)
-            params_dict["ocn.$(name)"] = denormalise_param(p_norm, name)
-        end
-        
-        # Add fixed parameters, then override nyears with the caller's value
-        for (key, val) in CLIMBER_FIXED_PARAMS
-            params_dict[key] = val
-        end
-        params_dict["ctl.nyears"] = nyears
-        
+        params_dict = build_member_params_dict(view(params_i, :, j), nyears)
+
         # Submit job
         try
             job_id, output_file = submit_climber_job_with_runme(
@@ -361,6 +370,28 @@ function validate_climber_output_file(output_file; min_size_bytes=100000, expect
         return true, "Valid"
     catch e
         return false, "Cannot read NetCDF: $e"
+    end
+end
+
+"""
+Read just the current length of a CLIMBER-X output file's `time` dimension --
+no size/completeness checks, just the raw count. Used to detect a genuinely
+stalled run: once SLURM confirms the writing process has exited, if this count
+is identical across two separate checks, nothing could possibly still be
+writing to the file -- that's not a transient filesystem lag, it's proof the
+run stopped early (crashed/diverged) and produced only partial output.
+Returns -1 if the file can't be read right now, so a transient/still-resolving
+read issue never gets mistaken for "stuck" -- callers should skip updating
+their own last-seen count on -1, not treat it as a real observation.
+"""
+function get_n_years_written(output_file)
+    try
+        ds = NCDataset(output_file)
+        n = haskey(ds, "time") ? length(ds["time"]) : -1
+        close(ds)
+        return n
+    catch
+        return -1
     end
 end
 
@@ -1201,14 +1232,24 @@ function run_climber_x_calibration(;
             )
             
             save_job_trackers(job_trackers, i, output_dir)
-            
+
+            # Resubmits a single member with the same parameters it originally got
+            # (params_i_norm doesn't change mid-iteration). Captures i/output_dir/
+            # work_dir/nyears from this closure's enclosing scope.
+            resubmit_fn = member_id -> submit_climber_job_with_runme(
+                i, member_id, build_member_params_dict(view(params_i_norm, :, member_id), nyears),
+                output_dir, work_dir; qos="standby", walltime="20:00:00"
+            )
+
             # Wait for completion
             result = wait_for_iteration_completion(
                 job_trackers;
                 check_interval_minutes=check_interval_minutes,
                 max_wait_days=max_wait_days,
                 output_dir=output_dir,
-                expected_nyears=nyears
+                expected_nyears=nyears,
+                resubmit_fn=resubmit_fn,
+                max_retries_per_member=2
             )
 
             if result == :timeout
@@ -1216,10 +1257,17 @@ function run_climber_x_calibration(;
             end
         end
 
-        # Collect results — always in full 102-dim space (PDF + 2 stats)
+        # Collect results — always in full 102-dim space (PDF + 2 stats).
+        # max_failures_allowed=0: a member reaching here as :failed already
+        # exhausted its resubmission retries in wait_for_iteration_completion,
+        # so any failure at this point is unrecoverable -- and, critically,
+        # EKS's IgnoreFailures handler does NOT actually exclude failed
+        # columns from update_ensemble! for the Sampler process (verified:
+        # it silently NaNs the *entire* ensemble's update, not just the
+        # failed member). So no failure can be tolerated past this point.
         G_ensemble = collect_climber_iteration_results(job_trackers, pdf_grid,
                                                        y_obs_full, uncertainties_full,
-                                                       max_failures_allowed=5,
+                                                       max_failures_allowed=0,
                                                        do_crossing_value=do_crossing_value,
                                                        do_method=do_method,
                                                        loess_span=loess_span,
