@@ -50,14 +50,18 @@ const PARAM_NAMES = [
     "diff_dia_max"
 ]
 
-# Prior bounds — plausible physical ranges expanded by 20% (±10% each side)
+# Prior bounds — narrowed from the earlier ±10%-padded ranges to exclude
+# regions of parameter space that cause CLIMBER-X to diverge numerically
+# (e.g. member 57, iter 1: drag_topo_fac=3.556, slope_max=0.0021,
+# diff_dia_max=9.0e-5 all fell outside these tighter bounds, and it
+# repeatedly stalled at year 4900/5000 across two independent resubmits).
 const PRIOR_BOUNDS = Dict(
-    "diff_dia_min" => (3.5e-6,  2.15e-5),
-    "drag_topo_fac" => (2.4,    3.6),
-    "slope_max"    => (3.5e-4,  2.15e-3),
-    "diff_iso"     => (350.0,   2150.0),
-    "diff_gm"      => (350.0,   2150.0),
-    "diff_dia_max" => (9e-5,    2.1e-4)
+    "diff_dia_min" => (5.0e-6,  2.0e-5),
+    "drag_topo_fac" => (2.5,    3.5),
+    "slope_max"    => (5.0e-4,  2.0e-3),
+    "diff_iso"     => (500.0,   2000.0),
+    "diff_gm"      => (500.0,   2000.0),
+    "diff_dia_max" => (1.0e-4,  2.0e-4)
 )
 
 # ── GPC-derived Gaussian prior ────────────────────────────────────────────────
@@ -105,6 +109,50 @@ function normalise_params(θ_mat)
         out[i, :] .= normalise_param.(θ_mat[i, :], name)
     end
     return out
+end
+
+"""
+Per-dimension moment-matched calibration of a bounded(0,1) Gaussian prior.
+
+A `bounded(0,1)` constraint maps EKS's internal unconstrained-space Gaussian
+through a logit transform into [0,1]. That transform is highly nonlinear
+once the unconstrained std is comparable to the box width -- several
+GPC_PRIOR_COV_PHYS marginal stds are 25-35% of their PRIOR_BOUNDS range.
+Naively normalising GPC_PRIOR_MEAN_PHYS/COV_PHYS into [0,1] with the same
+affine map used elsewhere, and treating that directly as the unconstrained-
+space Gaussian, collapses the actual (post-transform) [0,1] std by ~4-5x and
+drags the mean toward 0.5 (verified empirically -- e.g. drag_topo_fac's
+intended normalised std of 0.34 came out as an actual std of 0.08).
+
+Matching each marginal separately via EKP's own `constrained_gaussian`
+solver -- which finds the unconstrained (μ_u, σ_u) that reproduces a given
+constrained-space target mean/std through this exact transform -- fixes
+that: means/stds reproduce the GPC fit to within numerical precision. The
+off-diagonal correlations from GPC_PRIOR_COV_PHYS aren't separately
+re-matched (bounded() has no joint form of constrained_gaussian), so they
+see a small, quantified attenuation reusing them as-is (largest observed
+drift ~0.03 in correlation, e.g. 0.65 -> 0.62) -- far smaller than the
+marginal collapse this replaces.
+"""
+function calibrate_bounded_gaussian_prior(param_names, mean_phys, cov_phys, lo_vec, hi_vec)
+    sd_phys   = sqrt.(diag(cov_phys))
+    corr_phys = cov_phys ./ (sd_phys * sd_phys')
+
+    μ_c_norm = (mean_phys .- lo_vec) ./ (hi_vec .- lo_vec)
+    σ_c_norm = sd_phys ./ (hi_vec .- lo_vec)
+
+    μ_u = zeros(length(param_names))
+    σ_u = zeros(length(param_names))
+    for (i, name) in enumerate(param_names)
+        pd1  = constrained_gaussian(name, μ_c_norm[i], σ_c_norm[i], 0.0, 1.0)
+        dist = get_distribution(pd1)
+        dist = dist isa Dict ? first(values(dist)) : dist
+        μ_u[i] = mean(dist)
+        σ_u[i] = std(dist)
+    end
+
+    Σ_u = Diagonal(σ_u) * corr_phys * Diagonal(σ_u)
+    return μ_u, Symmetric((Σ_u + Σ_u') / 2)
 end
 
 function denormalise_params(p_mat)
@@ -898,40 +946,59 @@ function run_climber_x_calibration(;
     println("\nSetting up prior distributions...")
 
     # Joint Gaussian prior (GPC_PRIOR_MEAN_PHYS / GPC_PRIOR_COV_PHYS above),
-    # replacing the previous independent-per-parameter Uniform(0,1). All
-    # parameters are still normalised to [0,1] before EKS runs (no_constraint,
-    # as before) -- the physical-space Gaussian is mapped into that same
-    # [0,1] space via the same affine normalise_param transform, so it stays
-    # exactly Gaussian (no distortion from a nonlinear bounded transform).
+    # replacing the previous independent-per-parameter Uniform(0,1). Each
+    # dimension gets a bounded(0,1) constraint (a logit transform between
+    # EKS's internal unconstrained space and [0,1]-normalised physical
+    # space), rather than no_constraint() -- measured against the tightened
+    # PRIOR_BOUNDS, an unconstrained Gaussian would have ~6-15% of draws per
+    # parameter fall outside [0,1] every iteration, silently clamped to
+    # exactly the box edge (the divergence-prone region PRIOR_BOUNDS was
+    # tightened to exclude). See calibrate_bounded_gaussian_prior's
+    # docstring for why the unconstrained-space (μ, Σ) fed to MvNormal here
+    # is NOT just an affine rescaling of GPC_PRIOR_MEAN_PHYS/COV_PHYS --
+    # that naive approach collapses the resulting [0,1]-space std by ~4-5x
+    # (confirmed both against the real EKP.jl API and independently in
+    # gpc_gaussian_prior.ipynb section 7).
     # This is one *joint* multivariate distribution (not combine_distributions
-    # of independent ones), so it carries the correlations the GPC learned
-    # between parameters (e.g. diff_dia_min vs diff_gm).
+    # of independent ones), so it carries (an approximation of) the
+    # correlations the GPC learned between parameters.
     μ_phys = [GPC_PRIOR_MEAN_PHYS[name] for name in PARAM_NAMES]
     lo_vec = [param_lo(name) for name in PARAM_NAMES]
     hi_vec = [param_hi(name) for name in PARAM_NAMES]
-    D = Diagonal(1.0 ./ (hi_vec .- lo_vec))
 
-    μ_prior_norm = D * (μ_phys .- lo_vec)
-    Σ_prior_norm = Symmetric(D * GPC_PRIOR_COV_PHYS * D)
+    μ_prior_unconstrained, Σ_prior_unconstrained =
+        calibrate_bounded_gaussian_prior(PARAM_NAMES, μ_phys, GPC_PRIOR_COV_PHYS, lo_vec, hi_vec)
 
     prior = ParameterDistribution(
-        Parameterized(MvNormal(μ_prior_norm, Σ_prior_norm)),
-        repeat([no_constraint()], length(PARAM_NAMES)),
+        Parameterized(MvNormal(μ_prior_unconstrained, Σ_prior_unconstrained)),
+        repeat([bounded(0.0, 1.0)], length(PARAM_NAMES)),
         "ocean_params",
     )
 
-    # Add diagnostic
+    # Add diagnostic. construct_initial_ensemble draws in EKS's internal
+    # *unconstrained* space -- transform_unconstrained_to_constrained maps
+    # those through the bounded(0,1) logit to the actual [0,1] samples.
     println("\n  Verifying prior samples (physical space):")
-    test_ensemble = construct_initial_ensemble(prior, 5)
-    test_ensemble_phys = denormalise_params(test_ensemble)
+    test_ensemble = construct_initial_ensemble(prior, 2000)
+    test_ensemble_constrained = transform_unconstrained_to_constrained(prior, test_ensemble)
+    test_ensemble_phys = denormalise_params(test_ensemble_constrained)
     for (idx, name) in enumerate(PARAM_NAMES)
-        println("    $(name): $(test_ensemble_phys[idx, :])")
+        println("    $(name): $(test_ensemble_phys[idx, 1:5])")
     end
-    println("\n  NOTE: unlike the old Uniform(0,1) prior, a Gaussian has unbounded")
-    println("  support in normalised space -- individual draws above can occasionally")
-    println("  fall outside [0,1] (i.e. outside PRIOR_BOUNDS). submit_iteration_jobs_climber")
-    println("  already clamps to [0,1] before denormalising for the actual CLIMBER-X job")
-    println("  submission, so this is safe, but keep an eye on how often it triggers.")
+    println("\n  NOTE: bounded(0,1) per-dimension guarantees every draw stays strictly")
+    println("  inside [0,1] (i.e. inside PRIOR_BOUNDS) via a logit transform -- no")
+    println("  clamping needed. build_member_params_dict's clamp(...,0.0,1.0) is kept")
+    println("  purely as a defensive no-op for floating-point edge cases.")
+
+    println("\n  Sanity check -- 2000-sample empirical mean/std (physical) vs GPC target:")
+    for (idx, name) in enumerate(PARAM_NAMES)
+        emp_mean = mean(test_ensemble_phys[idx, :])
+        emp_std  = std(test_ensemble_phys[idx, :])
+        tgt_mean = GPC_PRIOR_MEAN_PHYS[name]
+        tgt_std  = sqrt(GPC_PRIOR_COV_PHYS[idx, idx])
+        println("    $(name): empirical=($(round(emp_mean, sigdigits=4)), $(round(emp_std, sigdigits=4)))" *
+                "  target=($(round(tgt_mean, sigdigits=4)), $(round(tgt_std, sigdigits=4)))")
+    end
     
     # Check for existing checkpoint to resume from
     start_iteration   = 1
@@ -1086,11 +1153,12 @@ function run_climber_x_calibration(;
         println("\n  Using real observation covariance (physical units, diag(uncertainties.^2))")
 
         println("\nInitializing EKI process...")
-        initial_ensemble = construct_initial_ensemble(prior, N_ensemble)
+        initial_ensemble = construct_initial_ensemble(prior, N_ensemble)  # unconstrained space
         eks_process = Sampler(prior)
 
+        initial_ensemble_constrained = transform_unconstrained_to_constrained(prior, initial_ensemble)
         println("\n  DEBUG: Initial ensemble after construction (physical space):")
-        initial_ensemble_phys = denormalise_params(initial_ensemble)
+        initial_ensemble_phys = denormalise_params(initial_ensemble_constrained)
         for j in 1:min(3, N_ensemble)
             println("  Member $j:")
             for (idx, name) in enumerate(PARAM_NAMES)
@@ -1116,10 +1184,12 @@ function run_climber_x_calibration(;
                 println("    $(name): $(params_after_init_phys[idx, j])")
             end
         end
-        # Diff comparison stays in [0,1] space (both sides are normalised)
-        println("\n  DEBUG: Comparing initial_ensemble vs get_ϕ_final (normalised space):")
+        # Both sides here must be in the *constrained* [0,1] space --
+        # initial_ensemble itself is unconstrained (see above), so compare
+        # its already-transformed version rather than the raw draws.
+        println("\n  DEBUG: Comparing initial_ensemble vs get_ϕ_final (normalised, constrained space):")
         for j in 1:min(3, N_ensemble)
-            println("  Member $j max difference: $(maximum(abs.(initial_ensemble[:, j] .- params_after_init[:, j])))")
+            println("  Member $j max difference: $(maximum(abs.(initial_ensemble_constrained[:, j] .- params_after_init[:, j])))")
         end
         
         param_history = zeros(length(PARAM_NAMES), N_iterations + 1, N_ensemble)
