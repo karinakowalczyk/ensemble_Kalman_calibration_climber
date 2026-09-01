@@ -658,6 +658,30 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
         println("    Stadial duration:  $(round(sqrt(mean(resid[n_pdf+2, :].^2)), digits=3))")
     end
 
+    # Impute failed members (still NaN at this point) before returning, so they
+    # never reach update_ensemble! as NaN -- EKS's IgnoreFailures handler does NOT
+    # actually exclude failed columns for the Sampler process (verified: any NaN
+    # corrupts the *entire* ensemble's update, not just the failed member). A
+    # failed member is treated as "as bad as the worst real member we saw": its
+    # PDF is set to the worst (max L2 distance from target) successfully-processed
+    # member's actual PDF -- a real, physically valid shape, not a fabricated one
+    # -- and its two dynamical stats to 0.0, matching the convention
+    # climber_summary_stats.jl already uses for genuine non-DO runs. Verified
+    # numerically safe (no NaN, no divergence, proportionate parameter shifts)
+    # against the real EKP.jl update machinery, including with several identical
+    # imputed columns in the same iteration.
+    failed_members = setdiff(1:N_ensemble, valid_members)
+    if !isempty(failed_members)
+        isempty(valid_members) && error("All $N_ensemble members failed -- nothing to impute failed members from")
+        worst_j = valid_members[argmax(l2_distances)]
+        for j in failed_members
+            G_ensemble[1:n_pdf, j]     = G_ensemble[1:n_pdf, worst_j]
+            G_ensemble[n_pdf+1:end, j] .= 0.0
+        end
+        println("\n  Imputed $(length(failed_members)) failed member(s): PDF <- worst real member " *
+                "(member $worst_j, L2=$(round(maximum(l2_distances), digits=6))), waiting_time/stadial_duration <- 0")
+    end
+
     return G_ensemble
 end
 
@@ -1319,7 +1343,7 @@ function run_climber_x_calibration(;
                 output_dir=output_dir,
                 expected_nyears=nyears,
                 resubmit_fn=resubmit_fn,
-                max_retries_per_member=2
+                max_retries_per_member=1
             )
 
             if result == :timeout
@@ -1328,16 +1352,21 @@ function run_climber_x_calibration(;
         end
 
         # Collect results — always in full 102-dim space (PDF + 2 stats).
-        # max_failures_allowed=0: a member reaching here as :failed already
-        # exhausted its resubmission retries in wait_for_iteration_completion,
-        # so any failure at this point is unrecoverable -- and, critically,
-        # EKS's IgnoreFailures handler does NOT actually exclude failed
-        # columns from update_ensemble! for the Sampler process (verified:
-        # it silently NaNs the *entire* ensemble's update, not just the
-        # failed member). So no failure can be tolerated past this point.
+        # A member reaching here as :failed already exhausted its resubmission
+        # retries in wait_for_iteration_completion, so it's unrecoverable this
+        # iteration -- but it no longer needs to abort the whole run:
+        # collect_climber_iteration_results imputes failed members (worst real
+        # member's PDF + waiting_time/stadial_duration=0) before returning, so
+        # update_ensemble! never sees NaN. (EKS's IgnoreFailures handler does NOT
+        # actually exclude failed columns for the Sampler process -- verified,
+        # it silently NaNs the *entire* ensemble's update -- so that imputation,
+        # not EKP's own mechanism, is what makes tolerating failures here safe.)
+        # max_failures_allowed=5 matches the tolerance used before that bug was
+        # found; it's just an upper bound on how many members can go missing
+        # before the imputed ones would dominate the ensemble.
         G_ensemble = collect_climber_iteration_results(job_trackers, pdf_grid,
                                                        y_obs_full, uncertainties_full,
-                                                       max_failures_allowed=0,
+                                                       max_failures_allowed=5,
                                                        do_crossing_value=do_crossing_value,
                                                        do_method=do_method,
                                                        loess_span=loess_span,

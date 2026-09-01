@@ -180,7 +180,7 @@ function wait_for_iteration_completion(job_trackers;
                                        max_unknown_checks=3,
                                        expected_nyears=nothing,
                                        resubmit_fn=nothing,
-                                       max_retries_per_member=2)
+                                       max_retries_per_member=1)
 
     println("\n  Waiting for jobs to complete...")
     println("  Checking every $check_interval_minutes minutes")
