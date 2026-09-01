@@ -1558,17 +1558,17 @@ end
 # ============================================
 
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
-    N_iterations=2,
+    N_iterations=3,
     N_ensemble=60,
     output_dir="/p/tmp/karinako/eki_calibration_test/output",
     work_dir="/p/tmp/karinako/eki_calibration_test/working",
     check_interval_minutes=30,
     max_wait_days=10,
     pdf_grid_points=100,
-    nyears=5000,
+    nyears=7000,
     do_crossing_value=5.0,
     do_method="loess",
-    loess_span=0.375, # 0.25,
+    loess_span=0.25, # 0.25,
     spinup_years=1000,
     n_threshold=2          # min n_do_events required for do_variability=true.
                            # 1 event gives no measurable waiting time (needs >=2 to get
