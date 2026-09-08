@@ -455,16 +455,25 @@ function initialize_pca_model(default_file::String, ensemble_files::Vector{Strin
 end
 
 """
-Estimate observation uncertainties by splitting the default run into blocks.
+Estimate observation uncertainties from overlapping sliding windows across the
+default run -- same strategy as calibrate_do_paper.ipynb's window analysis
+(section "Observational uncertainty"): windows of `window_size` years, starting
+every `stride_size` years, so a single long run yields many more (correlated,
+but far less noisy) samples than disjoint blocking would -- e.g. ~54 windows at
+30000yr/1000yr on a 73500yr run instead of ~10 disjoint blocks. This trades
+independence for a smoother variance estimate (a moving-block approach), the
+same tradeoff calibrate_do_paper.ipynb makes deliberately.
 
-Block size should match the length of calibration runs so that the std across
-blocks directly gives the uncertainty for one model evaluation.
+`window_size` is NOT tied to the calibration run's own `nyears` (unlike the old
+disjoint-block version's principle) -- it's an independently-chosen, fixed
+window length, matching the Python side's approach and default (30000yr,
+picked there after comparing 10000/20000/30000yr).
 
-Returns a Dict containing per-block data and derived uncertainty vectors.
+Returns a Dict containing per-window data and derived uncertainty vectors.
 Optionally saves the full result to `save_dir/block_uncertainty_analysis.jld2`.
 """
 function estimate_block_uncertainties(default_file::String, pdf_grid;
-                                       block_size=6000, min_do_events=2,
+                                       window_size=30000, stride_size=1000, min_do_events=2,
                                        remove_spinup=true, spinup_fraction=0.02,
                                        do_min_spacing=600, do_crossing_value=5.0,
                                        do_method="loess", loess_span=0.02,
@@ -479,13 +488,15 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
         time = time[start_idx:end]
     end
 
-    total_years = time[end] - time[1]
-    dt          = mean(diff(time))
-    block_steps = round(Int, block_size / dt)
-    n_blocks    = floor(Int, length(amoc) / block_steps)
+    total_years  = time[end] - time[1]
+    dt           = mean(diff(time))
+    win_steps    = round(Int, window_size / dt)
+    stride_steps = max(1, round(Int, stride_size / dt))
+    window_starts = collect(1:stride_steps:(length(amoc) - win_steps + 1))
+    n_blocks     = length(window_starts)
 
     println("  Run length after spinup: $(round(total_years, digits=0)) years")
-    println("  Block size: ~$block_size years  →  $n_blocks blocks")
+    println("  Window size: ~$window_size years, stride ~$stride_size years  →  $n_blocks overlapping windows")
 
     n_pdf             = length(pdf_grid)
     block_pdfs        = zeros(n_pdf, n_blocks)
@@ -495,9 +506,8 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
     block_start_times = zeros(n_blocks)
     block_end_times   = zeros(n_blocks)
 
-    for b in 1:n_blocks
-        idx_s = (b - 1) * block_steps + 1
-        idx_e = b * block_steps
+    for (b, idx_s) in enumerate(window_starts)
+        idx_e = idx_s + win_steps - 1
         amoc_b = amoc[idx_s:idx_e]
         time_b = time[idx_s:idx_e]
         block_start_times[b] = time_b[1]
@@ -522,23 +532,22 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
         block_n_do[b] = stats_b["n_do_events"]
     end
 
-    # Report per-block DO event counts
-    println("\n  Per-block DO event counts:")
-    for b in 1:n_blocks
-        flag = block_n_do[b] < min_do_events ? " ← excluded (< $min_do_events events)" : ""
-        println("    Block $b  ($(round(Int, block_start_times[b]))–$(round(Int, block_end_times[b])) yr):  $(block_n_do[b]) DO events$flag")
-    end
+    # Report per-window DO event counts (abbreviated -- there can be dozens with overlap)
+    n_short_of_threshold = sum(block_n_do .< min_do_events)
+    println("\n  Per-window DO event counts: min=$(minimum(block_n_do)), max=$(maximum(block_n_do))," *
+            " $n_short_of_threshold/$n_blocks below the $min_do_events-event threshold")
 
     valid_blocks = findall(block_n_do .>= min_do_events)
     n_valid = length(valid_blocks)
-    println("\n  Valid blocks: $n_valid / $n_blocks")
+    println("  Valid windows: $n_valid / $n_blocks")
 
     if n_valid < 2
-        error("Too few valid blocks ($n_valid) — reduce min_do_events or increase block_size")
+        error("Too few valid windows ($n_valid) — reduce min_do_events or window_size")
     end
 
-    # Uncertainties: std across valid blocks
-    # Since block_size ≈ calibration run length, no sqrt(N) scaling is needed.
+    # Uncertainties: std across valid (overlapping) windows -- no sqrt(N) scaling,
+    # since this is meant to estimate the noise floor for one window-length sample,
+    # not the uncertainty of the mean across windows.
     #
     # Floor near-zero grid-point uncertainties: the KDE PDF evaluates to exact 0.0 far
     # from where a block's data actually sits (e.g. the sparse high-Sv tail), so every
@@ -554,7 +563,7 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
     wt_uncertainty  = std(block_wts[valid_blocks])
     sd_uncertainty  = std(block_sds[valid_blocks])
 
-    println("\n  Derived uncertainties (std across $n_valid valid blocks):")
+    println("\n  Derived uncertainties (std across $n_valid valid overlapping windows):")
     if n_floored > 0
         println("    WARNING: floored $n_floored/$(length(raw_pdf_uncertainty)) near-zero PDF grid-point uncertainties")
     end
@@ -572,7 +581,8 @@ function estimate_block_uncertainties(default_file::String, pdf_grid;
         "block_end_times"    => block_end_times,
         "valid_blocks"       => valid_blocks,
         "n_blocks"           => n_blocks,
-        "block_size"         => block_size,
+        "window_size"        => window_size,
+        "stride_size"        => stride_size,
         "min_do_events"      => min_do_events,
         "pdf_uncertainty"    => pdf_uncertainty,
         "wt_uncertainty"     => wt_uncertainty,

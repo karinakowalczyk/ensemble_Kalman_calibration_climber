@@ -35,6 +35,15 @@ const DEFAULT_RUN_OUTPUT = "/p/tmp/karinako/default_run_long/0/ocn_ts.nc"
 # loess_span (tuned for the ensemble's own, possibly very different, run length).
 const DEFAULT_RUN_LOESS_SPAN = 0.02
 
+# estimate_block_uncertainties uses fixed-length (30000yr) overlapping windows,
+# matching calibrate_do_paper.ipynb's window-analysis strategy -- independent of
+# both the ensemble's nyears AND the default run's own 75000yr length, so it needs
+# its own independently-scaled LOESS span too: 0.05 * 30000 = ~1500yr absolute,
+# same convention as DEFAULT_RUN_LOESS_SPAN.
+const WINDOW_UNCERTAINTY_SIZE   = 30000
+const WINDOW_UNCERTAINTY_STRIDE = 1000
+const WINDOW_UNCERTAINTY_LOESS_SPAN = 0.05
+
 # Fixed CLIMBER-X parameters
 const CLIMBER_FIXED_PARAMS = Dict(
     "ctl.nyears" => 7000,
@@ -1108,13 +1117,14 @@ function run_climber_x_calibration(;
         println("    N DO events: $(stats_default["n_do_events"])")
         println("    N stadials: $(stats_default["n_stadials"])")
 
-        # Estimate uncertainties from default-run blocks
-        println("\nEstimating observation uncertainties from default run blocks...")
+        # Estimate uncertainties from overlapping windows of the default run --
+        # same strategy as calibrate_do_paper.ipynb's window analysis.
+        println("\nEstimating observation uncertainties from default run windows...")
         block_analysis = estimate_block_uncertainties(
             DEFAULT_RUN_OUTPUT, pdf_grid;
-            block_size=7000, min_do_events=2,
+            window_size=WINDOW_UNCERTAINTY_SIZE, stride_size=WINDOW_UNCERTAINTY_STRIDE, min_do_events=2,
             do_min_spacing=600, do_crossing_value=do_crossing_value,
-            do_method=do_method, loess_span=loess_span,
+            do_method=do_method, loess_span=WINDOW_UNCERTAINTY_LOESS_SPAN,
             n_threshold=n_threshold,
             save_dir=output_dir
         )
@@ -1221,12 +1231,12 @@ function run_climber_x_calibration(;
 
     # On resume, block_analysis was not computed inside the checkpoint branch — do it now.
     if isnothing(block_analysis)
-        println("\nEstimating observation uncertainties from default run blocks (resumed run)...")
+        println("\nEstimating observation uncertainties from default run windows (resumed run)...")
         block_analysis = estimate_block_uncertainties(
             DEFAULT_RUN_OUTPUT, pdf_grid;
-            block_size=7000, min_do_events=2,
+            window_size=WINDOW_UNCERTAINTY_SIZE, stride_size=WINDOW_UNCERTAINTY_STRIDE, min_do_events=2,
             do_min_spacing=600, do_crossing_value=do_crossing_value,
-            do_method=do_method, loess_span=loess_span,
+            do_method=do_method, loess_span=WINDOW_UNCERTAINTY_LOESS_SPAN,
             n_threshold=n_threshold,
             save_dir=output_dir
         )
