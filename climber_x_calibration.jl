@@ -28,6 +28,12 @@ include("climber_summary_stats.jl")
 const CLIMBER_X_DIR = "/home/karinako/climber-x"
 const RUNME_SCRIPT = joinpath(CLIMBER_X_DIR, "runme")
 const DEFAULT_RUN_OUTPUT = "/p/tmp/karinako/default_run_long/0/ocn_ts.nc"
+# The default run is always 75000 years, independent of whatever `nyears` a given
+# calibration run uses for its ensemble members -- so its own LOESS window must be
+# fixed to that length (0.02 * 75000 = ~1500yr absolute, matching this project's
+# established ~1500yr-absolute-window convention), not inherit the ensemble's
+# loess_span (tuned for the ensemble's own, possibly very different, run length).
+const DEFAULT_RUN_LOESS_SPAN = 0.02
 
 # Fixed CLIMBER-X parameters
 const CLIMBER_FIXED_PARAMS = Dict(
@@ -1065,13 +1071,19 @@ function run_climber_x_calibration(;
         # do_min_spacing=600 to match every ensemble-member call site below (was 500 --
         # comparing the calibration target against predictions computed with different
         # DO-detection settings; 600 also matches DO_MIN_SPACING in the emulator approach).
+        # loess_span=DEFAULT_RUN_LOESS_SPAN (NOT the ensemble's loess_span): the default
+        # run is always 75000 years regardless of this run's nyears, so its LOESS window
+        # must be scaled to its own fixed length to stay ~1500yr absolute -- reusing the
+        # ensemble's loess_span here previously gave e.g. an ~18000yr window for a
+        # nyears=7000 run (loess_span=0.25), over 10x too wide, silently miscalibrating
+        # every run's waiting-time target against its predictions.
         stats_default = compute_summary_stats(amoc_default;
                                              time_data=time_default,
                                              remove_spinup=false,
                                              spinup_fraction=0.0,
                                              adaptive_threshold=true,
                                              threshold_method="clustering",
-                                             loess_span=loess_span,
+                                             loess_span=DEFAULT_RUN_LOESS_SPAN,
                                              do_min_spacing=600,
                                              do_crossing_value=do_crossing_value,
                                              do_method=do_method,
@@ -1123,21 +1135,27 @@ function run_climber_x_calibration(;
         # pre-whitening the data (see gp_emulator.py: its StandardScaler is inverted
         # before predictions ever reach the likelihood -- physical units all the way
         # through the actual statistical step, which is what this now mirrors).
-        y_obs = y_obs_raw
-
-        # Keep 102-dim copies — needed for PCA fitting and G projection in :pca mode
-        y_obs_full         = y_obs
+        # Keep 102-dim copies — needed for PCA fitting, G projection, and stadial-duration
+        # tracking regardless of calibration mode.
+        y_obs_full         = y_obs_raw
         uncertainties_full = uncertainties
+
+        # Calibration target excludes stadial_duration (last element) -- PDF + waiting_time
+        # only. Stadial duration is still computed and tracked throughout (in G_ensemble,
+        # results files, and the final-performance report), just not part of what EKS is
+        # actually calibrated against.
+        y_obs         = y_obs_full[1:end-1]
+        uncertainties = uncertainties_full[1:end-1]
 
         obs_noise_cov = Diagonal(uncertainties.^2)
 
         println("\n  Using real observation covariance (physical units, diag(uncertainties.^2))")
         let n_pdf = length(pdf_grid)
-            println("  Observation uncertainties in use:")
+            println("  Observation uncertainties in use (calibration target -- PDF + waiting_time only):")
             println("    PDF: mean per-grid-point σ=$(round(mean(uncertainties[1:n_pdf]), digits=6))," *
                     " max σ=$(round(maximum(uncertainties[1:n_pdf]), digits=6))")
             println("    Waiting time σ:     $(round(uncertainties[n_pdf+1], digits=1)) years")
-            println("    Stadial duration σ: $(round(uncertainties[n_pdf+2], digits=1)) years")
+            println("    (Stadial duration σ: $(round(uncertainties_full[n_pdf+2], digits=1)) years -- tracked, not in target)")
         end
 
         println("\nInitializing EKI process...")
@@ -1191,7 +1209,7 @@ function run_climber_x_calibration(;
             "stadial_duration_uncertainty" => STADIAL_DURATION_UNCERTAINTY,
             "default_run" => DEFAULT_RUN_OUTPUT,
             "distance_metric" => "L2",
-            "observations" => "PDF + waiting_time + stadial_duration (physical units)",
+            "observations" => "PDF + waiting_time (calibration target); stadial_duration tracked but not targeted (physical units)",
             "normalization" => "none -- obs_noise_cov = diag(uncertainties.^2)"
         )
         
@@ -1220,11 +1238,12 @@ function run_climber_x_calibration(;
     let n_pdf = length(pdf_grid)
         # uncertainties itself may already be PCA-reduced here (:pca mode, resumed
         # past iteration 1) -- uncertainties_full is always the full 102-dim vector.
-        println("\n  Observation uncertainties in use (resumed, full 102-dim basis):")
+        println("\n  Observation uncertainties (resumed, full 102-dim basis -- tracking only,")
+        println("  actual calibration target may be a reduced slice of this, see uncertainties):")
         println("    PDF: mean per-grid-point σ=$(round(mean(uncertainties_full[1:n_pdf]), digits=6))," *
                 " max σ=$(round(maximum(uncertainties_full[1:n_pdf]), digits=6))")
         println("    Waiting time σ:     $(round(uncertainties_full[n_pdf+1], digits=1)) years")
-        println("    Stadial duration σ: $(round(uncertainties_full[n_pdf+2], digits=1)) years")
+        println("    (Stadial duration σ: $(round(uncertainties_full[n_pdf+2], digits=1)) years -- tracked, not in target)")
     end
 
     metadata = Dict(
@@ -1238,7 +1257,7 @@ function run_climber_x_calibration(;
         "stadial_duration_uncertainty" => STADIAL_DURATION_UNCERTAINTY,
         "default_run" => DEFAULT_RUN_OUTPUT,
         "distance_metric" => "L2",
-        "observations" => "PDF + waiting_time + stadial_duration (physical units)",
+        "observations" => "PDF + waiting_time (calibration target); stadial_duration tracked but not targeted (physical units)",
         "normalization" => "none -- obs_noise_cov = diag(uncertainties.^2)"
     )
     
@@ -1366,10 +1385,12 @@ function run_climber_x_calibration(;
                                          block_analysis["block_pdfs"][:, b]))
                                      for b in valid_b]...)  # (n_pca_full × n_valid)
             pca_uncertainties = vec(std(block_pca_coords[1:N_PCA_COMPONENTS, :], dims=2))
+            # Calibration target excludes stadial_duration -- PDF (via PCA) + waiting_time
+            # only. sd_uncertainty/sd_phys are still computed just below, for tracking/
+            # printing, but not included in `uncertainties`/`y_obs` (what EKS actually uses).
             uncertainties = vcat(
                 pca_uncertainties,
-                block_analysis["wt_uncertainty"],
-                block_analysis["sd_uncertainty"]
+                block_analysis["wt_uncertainty"]
             )
             # Floor near-zero uncertainties -- same rationale as pdf_uncertainty in
             # estimate_block_uncertainties: a real Γ diagonal shouldn't have exact
@@ -1381,30 +1402,33 @@ function run_climber_x_calibration(;
             # throughout (y_obs_full is already physical).
             pdf_obs_phys = y_obs_full[1:n_pdf]
             wt_phys      = y_obs_full[n_pdf + 1]
-            sd_phys      = y_obs_full[n_pdf + 2]
+            sd_phys      = y_obs_full[n_pdf + 2]  # tracked/printed only, not in y_obs
             pca_obs      = vec(MultivariateStats.transform(pca_model, pdf_obs_phys))
-            y_obs = vcat(pca_obs[1:N_PCA_COMPONENTS], wt_phys, sd_phys)
+            y_obs = vcat(pca_obs[1:N_PCA_COMPONENTS], wt_phys)
 
             println("\n  PCA target observations (physical units):")
             for k in 1:N_PCA_COMPONENTS
                 println("    PCA component $k: $(round(y_obs[k], digits=3)) ± $(round(uncertainties[k], digits=3))")
             end
             println("    Waiting time:     $(round(y_obs[N_PCA_COMPONENTS+1], digits=1)) ± $(round(uncertainties[N_PCA_COMPONENTS+1], digits=1)) yr")
-            println("    Stadial duration: $(round(y_obs[N_PCA_COMPONENTS+2], digits=1)) ± $(round(uncertainties[N_PCA_COMPONENTS+2], digits=1)) yr")
+            println("    (Stadial duration: $(round(sd_phys, digits=1)) ± $(round(block_analysis["sd_uncertainty"], digits=1)) yr -- tracked, not in target)")
 
-            # Reinitialise EKS with current ensemble state and updated 7-dim observations.
-            # EKS is memoryless between steps (only uses current ensemble), so this is exact.
+            # Reinitialise EKS with current ensemble state and updated (N_PCA_COMPONENTS+1)-dim
+            # observations. EKS is memoryless between steps (only uses current ensemble), so
+            # this is exact.
             u_current     = get_u_final(eksobj)
             obs_noise_cov = Diagonal(uncertainties.^2)
             eksobj = EnsembleKalmanProcess(u_current, y_obs, obs_noise_cov,
                                            Sampler(prior); verbose=true)
-            println("  ✓ EKS reinitialised with $(N_PCA_COMPONENTS + 2)-dim PCA observations")
+            println("  ✓ EKS reinitialised with $(N_PCA_COMPONENTS + 1)-dim PCA observations (PDF + waiting_time)")
 
-            # Project full G_ensemble to PCA space for the EKI update
-            G_for_update = project_g_to_pca(G_ensemble, pca_model, n_pdf)
+            # Project full G_ensemble to PCA space for the EKI update, then drop the
+            # stadial_duration row (last) -- tracked in G_ensemble, not calibrated against.
+            G_for_update = project_g_to_pca(G_ensemble, pca_model, n_pdf)[1:end-1, :]
         else
-            # :pdf mode — use full 102-dim G directly
-            G_for_update = G_ensemble
+            # :pdf mode — full PDF + waiting_time, dropping stadial_duration (last row);
+            # G_ensemble itself still keeps it, for tracking.
+            G_for_update = G_ensemble[1:end-1, :]
         end
 
         # Update ensemble
@@ -1528,7 +1552,7 @@ end
 # ============================================
 
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
-    N_iterations=4,
+    N_iterations=3,
     N_ensemble=100,
     output_dir="/p/tmp/karinako/eki_calibration_test/output",
     work_dir="/p/tmp/karinako/eki_calibration_test/working",
@@ -1538,8 +1562,8 @@ eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibra
     nyears=7000,
     do_crossing_value=5.0,
     do_method="loess",
-    loess_span=0.25, # 0.25,
-    spinup_years=1000,
+    loess_span=0.25, # 0.02, # 0.25,
+    spinup_years=1000, # 1500
     n_threshold=2          # min n_do_events required for do_variability=true.
                            # 1 event gives no measurable waiting time (needs >=2 to get
                            # a gap between onsets), so avg_waiting_time=0.0 would mean
