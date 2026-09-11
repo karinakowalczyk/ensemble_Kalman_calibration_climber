@@ -27,6 +27,14 @@ include("climber_summary_stats.jl")
 
 const CLIMBER_X_DIR = "/home/karinako/climber-x"
 const RUNME_SCRIPT = joinpath(CLIMBER_X_DIR, "runme")
+# SLURM walltime for each CLIMBER-X job, "HH:MM:SS". Must comfortably exceed the
+# longest run this config will need (a 75000yr run needs ~150h) -- was previously
+# hardcoded to "20:00:00" in 3 separate places (easy to update one and miss the
+# others), now a single source of truth. Confirmed the "standby" QOS on this
+# cluster caps walltime at 7 days (168h); 165h leaves 15h margin over the stated
+# 150h requirement while staying 3h clear of that hard cap (not requesting exactly
+# the cap, to avoid any edge-case scheduler rejection right at the boundary).
+const CLIMBER_WALLTIME = "165:00:00"
 const DEFAULT_RUN_OUTPUT = "/p/tmp/karinako/default_run_long/0/ocn_ts.nc"
 # The default run is always 75000 years, independent of whatever `nyears` a given
 # calibration run uses for its ensemble members -- so its own LOESS window must be
@@ -44,9 +52,11 @@ const WINDOW_UNCERTAINTY_SIZE   = 30000
 const WINDOW_UNCERTAINTY_STRIDE = 1000
 const WINDOW_UNCERTAINTY_LOESS_SPAN = 0.05
 
-# Fixed CLIMBER-X parameters
+# Fixed CLIMBER-X parameters. Deliberately excludes "ctl.nyears" -- that's always
+# set separately in build_member_params_dict from the actual run's `nyears`
+# argument, so a placeholder value here would only ever be silently overwritten
+# (previously 7000, which could look like it mattered but never did).
 const CLIMBER_FIXED_PARAMS = Dict(
-    "ctl.nyears" => 7000,
     "ctl.co2_const" => 190,
     "ctl.fake_geo_const_file" => "input/geo_ice_tarasov_12ka.nc",
     "ctl.fake_ice_const_file" => "input/geo_ice_tarasov_12ka.nc",
@@ -213,8 +223,8 @@ end
 Submit a CLIMBER-X job using runme -s (submit mode)
 Returns the job ID and expected output file path
 """
-function submit_climber_job_with_runme(iteration, member_id, params_dict, output_dir, work_dir; 
-                                       walltime="20:00:00", qos="standby", omp=32)
+function submit_climber_job_with_runme(iteration, member_id, params_dict, output_dir, work_dir;
+                                       walltime=CLIMBER_WALLTIME, qos="standby", omp=32)
     # Output directory for this member
     member_output_dir = joinpath(output_dir, "iter_$(iteration)", "member_$(member_id)")
     
@@ -310,7 +320,7 @@ function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir
             job_id, output_file = submit_climber_job_with_runme(
                 iteration, j, params_dict, output_dir, work_dir;
                 qos="standby",
-                walltime="20:00:00"
+                walltime=CLIMBER_WALLTIME
             )
             
             tracker = JobTracker(
@@ -1331,7 +1341,7 @@ function run_climber_x_calibration(;
             # work_dir/nyears from this closure's enclosing scope.
             resubmit_fn = member_id -> submit_climber_job_with_runme(
                 i, member_id, build_member_params_dict(view(params_i_norm, :, member_id), nyears),
-                output_dir, work_dir; qos="standby", walltime="20:00:00"
+                output_dir, work_dir; qos="standby", walltime=CLIMBER_WALLTIME
             )
 
             # Wait for completion
@@ -1342,7 +1352,11 @@ function run_climber_x_calibration(;
                 output_dir=output_dir,
                 expected_nyears=nyears,
                 resubmit_fn=resubmit_fn,
-                max_retries_per_member=1
+                # 0, not 1: with CLIMBER_WALLTIME=165h, a resubmit costs another ~165h --
+                # too expensive at nyears=75000. A stalled/failed member goes straight to
+                # collect_climber_iteration_results' worst-member-PDF + 0-waiting-time
+                # imputation instead of getting a second attempt.
+                max_retries_per_member=0
             )
 
             if result == :timeout
@@ -1562,18 +1576,21 @@ end
 # ============================================
 
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
-    N_iterations=3,
+    N_iterations=7,
     N_ensemble=100,
-    output_dir="/p/tmp/karinako/eki_calibration_test/output",
-    work_dir="/p/tmp/karinako/eki_calibration_test/working",
+    output_dir="/p/tmp/karinako/eki_calibration_75ky/output",
+    work_dir="/p/tmp/karinako/eki_calibration_75ky/working",
     check_interval_minutes=30,
-    max_wait_days=10,
+    # max_retries_per_member=0 below means each member gets one attempt (up to
+    # CLIMBER_WALLTIME=165h), no resubmit -- 20 days is generous headroom over that
+    # for standby-QOS queue wait before a job even starts running, not for a retry.
+    max_wait_days=20,
     pdf_grid_points=100,
-    nyears=7000,
+    nyears=75000,
     do_crossing_value=5.0,
     do_method="loess",
-    loess_span=0.25, # 0.02, # 0.25,
-    spinup_years=1000, # 1500
+    loess_span=0.02, # 0.25,
+    spinup_years=1500, # 1500
     n_threshold=2          # min n_do_events required for do_variability=true.
                            # 1 event gives no measurable waiting time (needs >=2 to get
                            # a gap between onsets), so avg_waiting_time=0.0 would mean
