@@ -30,11 +30,17 @@ const RUNME_SCRIPT = joinpath(CLIMBER_X_DIR, "runme")
 # SLURM walltime for each CLIMBER-X job, "HH:MM:SS". Must comfortably exceed the
 # longest run this config will need (a 75000yr run needs ~150h) -- was previously
 # hardcoded to "20:00:00" in 3 separate places (easy to update one and miss the
-# others), now a single source of truth. Confirmed the "standby" QOS on this
-# cluster caps walltime at 7 days (168h); 165h leaves 15h margin over the stated
-# 150h requirement while staying 3h clear of that hard cap (not requesting exactly
-# the cap, to avoid any edge-case scheduler rejection right at the boundary).
+# others), now a single source of truth. Confirmed both "standby" and "medium" QOS
+# on this cluster cap walltime at 7 days (168h); 165h leaves 15h margin over the
+# stated 150h requirement while staying 3h clear of that hard cap (not requesting
+# exactly the cap, to avoid any edge-case scheduler rejection right at the
+# boundary).
 const CLIMBER_WALLTIME = "165:00:00"
+# "standby" (priority 2500) is the QOS actual preemptions were observed under --
+# `medium` (priority 5000, same 7-day walltime cap) doesn't get preempted by
+# standby-tier jobs the way standby itself does, at the cost of counting against
+# the group's allocated core-hours rather than running as free backfill capacity.
+const CLIMBER_QOS = "medium"
 const DEFAULT_RUN_OUTPUT = "/p/tmp/karinako/default_run_long/0/ocn_ts.nc"
 # The default run is always 75000 years, independent of whatever `nyears` a given
 # calibration run uses for its ensemble members -- so its own LOESS window must be
@@ -224,7 +230,7 @@ Submit a CLIMBER-X job using runme -s (submit mode)
 Returns the job ID and expected output file path
 """
 function submit_climber_job_with_runme(iteration, member_id, params_dict, output_dir, work_dir;
-                                       walltime=CLIMBER_WALLTIME, qos="standby", omp=32)
+                                       walltime=CLIMBER_WALLTIME, qos=CLIMBER_QOS, omp=32)
     # Output directory for this member
     member_output_dir = joinpath(output_dir, "iter_$(iteration)", "member_$(member_id)")
     
@@ -297,11 +303,13 @@ end
 """
 Submit CLIMBER-X jobs for one iteration using runme
 """
-function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir; nyears=7000)
+function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir; nyears=7000, members=1:size(params_i, 2))
     N_ensemble = size(params_i, 2)
+    n_submit = length(members)
     job_trackers = JobTracker[]
 
-    println("\n  Submitting $N_ensemble CLIMBER-X jobs for iteration $iteration...")
+    println("\n  Submitting $n_submit CLIMBER-X jobs for iteration $iteration" *
+            (n_submit == N_ensemble ? "" : " (of $N_ensemble total; rest already have valid output)") * "...")
     println("  Using runme -rs to submit jobs")
     println("  Run length: $nyears years")
 
@@ -311,18 +319,19 @@ function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir
         error("Insufficient disk space")
     end
 
-    # Submit jobs
-    for j in 1:N_ensemble
+    # Submit jobs. `members` indexes into params_i's columns -- params_i itself stays
+    # the full (6 x N_ensemble) matrix even when only a subset is being (re)submitted.
+    for (k, j) in enumerate(members)
         params_dict = build_member_params_dict(view(params_i, :, j), nyears)
 
         # Submit job
         try
             job_id, output_file = submit_climber_job_with_runme(
                 iteration, j, params_dict, output_dir, work_dir;
-                qos="standby",
+                qos=CLIMBER_QOS,
                 walltime=CLIMBER_WALLTIME
             )
-            
+
             tracker = JobTracker(
                 job_id,
                 j,
@@ -334,22 +343,22 @@ function submit_iteration_jobs_climber(params_i, iteration, work_dir, output_dir
                 output_file
             )
             push!(job_trackers, tracker)
-            
-            if j % 10 == 0 || j == N_ensemble
-                println("    Submitted $j/$N_ensemble jobs")
+
+            if k % 10 == 0 || k == n_submit
+                println("    Submitted $k/$n_submit jobs")
             end
-            
+
             sleep(2)  # Rate limiting
-            
+
         catch e
             @error "Failed to submit member $j" exception=e
         end
     end
     
-    if length(job_trackers) < N_ensemble
-        @warn "Only submitted $(length(job_trackers))/$N_ensemble jobs successfully"
+    if length(job_trackers) < n_submit
+        @warn "Only submitted $(length(job_trackers))/$n_submit jobs successfully"
     else
-        println("  ✓ All $N_ensemble jobs submitted!")
+        println("  ✓ All $n_submit jobs submitted!")
     end
     
     return job_trackers
@@ -370,16 +379,23 @@ size/variable bar, so without this check a still-running job gets marked
 :completed and processed on truncated, mid-simulation data.
 """
 function validate_climber_output_file(output_file; min_size_bytes=100000, expected_nyears=nothing)
-    if !isfile(output_file)
-        return false, "File does not exist"
-    end
-
-    file_size = filesize(output_file)
-    if file_size < min_size_bytes
-        return false, "File too small: $(file_size) bytes"
-    end
-
+    # Whole body wrapped, not just the NCDataset read below -- isfile/filesize are
+    # plain stat() calls, which can just as easily hit a transient filesystem error
+    # (e.g. NFS "stale file handle", confirmed to actually happen on this cluster --
+    # it's what crashed the whole calibration process once already) as opening the
+    # file can. Uncaught, that's an IOError that kills the entire process; caught
+    # here, it's treated the same as "not valid (yet)" -- the caller already retries
+    # on the next poll cycle regardless of the specific reason.
     try
+        if !isfile(output_file)
+            return false, "File does not exist"
+        end
+
+        file_size = filesize(output_file)
+        if file_size < min_size_bytes
+            return false, "File too small: $(file_size) bytes"
+        end
+
         ds = NCDataset(output_file)
         has_amoc = haskey(ds, "amoc26N")
         has_time = haskey(ds, "time")
@@ -398,7 +414,7 @@ function validate_climber_output_file(output_file; min_size_bytes=100000, expect
 
         return true, "Valid"
     catch e
-        return false, "Cannot read NetCDF: $e"
+        return false, "Cannot read/stat file (possibly transient filesystem error): $e"
     end
 end
 
@@ -1300,27 +1316,34 @@ function run_climber_x_calibration(;
             end
         end
         
-        # Check if iteration already has completed outputs. expected_nyears=nyears
-        # so a still-running job's partial file (which otherwise looks "valid" --
-        # right size, right variables, just not enough years yet) doesn't get
-        # mistaken for a finished one and skip-reused.
+        # Check per-member which outputs already exist and validate, rather than
+        # all-or-nothing across the whole iteration -- if the Julia driver process
+        # previously died mid-iteration (crash, filesystem error, etc.) after some
+        # members had already completed, this reuses those instead of resubmitting
+        # every member from scratch (at CLIMBER_WALLTIME=165h each, potentially
+        # wasting up to N_ensemble * 165h of already-finished work). expected_nyears
+        # =nyears so a still-running job's partial file (which otherwise looks
+        # "valid" -- right size, right variables, just not enough years yet)
+        # doesn't get mistaken for a finished one and skip-reused.
         iter_dir = joinpath(output_dir, "iter_$(i)")
-        all_outputs_exist = true
+        already_done = Int[]
+        needs_submission = Int[]
         if isdir(iter_dir)
             for j in 1:N_ensemble
                 output_file = joinpath(iter_dir, "member_$(j)", "ocn_ts.nc")
-                if !validate_climber_output_file(output_file; expected_nyears=nyears)[1]
-                    all_outputs_exist = false
-                    break
+                if validate_climber_output_file(output_file; expected_nyears=nyears)[1]
+                    push!(already_done, j)
+                else
+                    push!(needs_submission, j)
                 end
             end
         else
-            all_outputs_exist = false
+            needs_submission = collect(1:N_ensemble)
         end
-        
-        if all_outputs_exist
-            println("  Found existing outputs for iteration $i, skipping job submission...")
-            
+
+        if isempty(needs_submission)
+            println("  Found existing outputs for all $N_ensemble members of iteration $i, skipping job submission...")
+
             # Create dummy job trackers with completed status
             job_trackers = JobTracker[]
             for j in 1:N_ensemble
@@ -1329,11 +1352,30 @@ function run_climber_x_calibration(;
                 push!(job_trackers, tracker)
             end
         else
+            if !isempty(already_done)
+                println("  $(length(already_done))/$N_ensemble members of iteration $i already have valid " *
+                        "output -- reusing, not resubmitting: $already_done")
+            end
+
             # Submit jobs (pass normalised params; function denormalises internally)
-            job_trackers = submit_iteration_jobs_climber(
-                params_i_norm, i, work_dir, output_dir; nyears=nyears
+            # -- only for members that actually need it.
+            new_trackers = submit_iteration_jobs_climber(
+                params_i_norm, i, work_dir, output_dir; nyears=nyears, members=needs_submission
             )
-            
+
+            # Reassemble in member_id order (1:N_ensemble) -- downstream code
+            # (collect_climber_iteration_results etc.) indexes G_ensemble/params_i
+            # columns by position in job_trackers, assumed to line up with member_id.
+            member_trackers = Dict{Int, JobTracker}(
+                j => JobTracker("existing", j, i, :completed, now(), now(), "",
+                                 joinpath(iter_dir, "member_$(j)", "ocn_ts.nc"))
+                for j in already_done
+            )
+            for t in new_trackers
+                member_trackers[t.member_id] = t
+            end
+            job_trackers = [member_trackers[j] for j in 1:N_ensemble]
+
             save_job_trackers(job_trackers, i, output_dir)
 
             # Resubmits a single member with the same parameters it originally got
@@ -1341,7 +1383,7 @@ function run_climber_x_calibration(;
             # work_dir/nyears from this closure's enclosing scope.
             resubmit_fn = member_id -> submit_climber_job_with_runme(
                 i, member_id, build_member_params_dict(view(params_i_norm, :, member_id), nyears),
-                output_dir, work_dir; qos="standby", walltime=CLIMBER_WALLTIME
+                output_dir, work_dir; qos=CLIMBER_QOS, walltime=CLIMBER_WALLTIME
             )
 
             # Wait for completion
@@ -1353,10 +1395,15 @@ function run_climber_x_calibration(;
                 expected_nyears=nyears,
                 resubmit_fn=resubmit_fn,
                 # 0, not 1: with CLIMBER_WALLTIME=165h, a resubmit costs another ~165h --
-                # too expensive at nyears=75000. A stalled/failed member goes straight to
-                # collect_climber_iteration_results' worst-member-PDF + 0-waiting-time
-                # imputation instead of getting a second attempt.
-                max_retries_per_member=0
+                # too expensive at nyears=75000 for a genuinely stuck/diverged member,
+                # which goes straight to collect_climber_iteration_results'
+                # worst-member-PDF + 0-waiting-time imputation instead of a second attempt.
+                max_retries_per_member=0,
+                # Preemption/node-failure are infrastructure noise, not evidence the
+                # parameters are bad -- worth up to 2 resubmits (observed directly: 6
+                # preempted + 4 node-failed members in one iteration on qos="standby",
+                # none of them genuine divergence) before falling back to imputation too.
+                max_infra_retries=2
             )
 
             if result == :timeout

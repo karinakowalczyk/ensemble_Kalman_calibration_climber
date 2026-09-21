@@ -49,6 +49,17 @@ function check_job_status(job_id; max_retries=3, initial_delay=5)
                 return :running
             elseif occursin("PENDING", status_line)
                 return :submitted
+            elseif occursin("PREEMPTED", status_line)
+                # Infrastructure, not parameter-related: SLURM killed the job to give
+                # the node to higher-priority work, nothing to do with what the job
+                # was actually running. Distinguished from :failed so it can get a
+                # more generous retry allowance -- see wait_for_iteration_completion.
+                return :preempted
+            elseif occursin("NODE_FAIL", status_line)
+                # Hardware fault, same reasoning as :preempted above -- note this does
+                # NOT match occursin("FAILED", ...) ("NODE_FAIL" is missing the "ED"),
+                # so without this explicit branch it silently fell through to :unknown.
+                return :node_fail
             elseif occursin("TIMEOUT", status_line)
                 return :timeout
             elseif occursin("OUT_OF_MEMORY", status_line)
@@ -180,7 +191,8 @@ function wait_for_iteration_completion(job_trackers;
                                        max_unknown_checks=3,
                                        expected_nyears=nothing,
                                        resubmit_fn=nothing,
-                                       max_retries_per_member=1)
+                                       max_retries_per_member=1,
+                                       max_infra_retries=2)
 
     println("\n  Waiting for jobs to complete...")
     println("  Checking every $check_interval_minutes minutes")
@@ -235,6 +247,16 @@ function wait_for_iteration_completion(job_trackers;
                             @warn "Member $(tracker.member_id): SLURM completed but output not yet valid ($valid_msg) — will recheck next cycle"
                         end
                     end
+
+                elseif new_status in [:preempted, :node_fail]
+                    # Infrastructure failure, not evidence of bad parameters (a preempted
+                    # job was bumped for a higher-priority job; a node failure is a
+                    # hardware fault) -- worth a more generous retry budget than the
+                    # genuine-divergence cases below, where retrying is usually pointless.
+                    attempt_resubmit!(tracker, "SLURM status: $new_status (infrastructure)",
+                                       retry_counts, resubmit_fn, max_infra_retries)
+                    last_years_written[tracker.member_id] = nothing
+                    unknown_counts[tracker.member_id] = 0
 
                 elseif new_status in [:failed, :timeout, :oom, :cancelled]
                     attempt_resubmit!(tracker, "SLURM status: $new_status", retry_counts, resubmit_fn, max_retries_per_member)
