@@ -1783,7 +1783,7 @@ end
 # include()d by tests without starting a calibration.
 if abspath(PROGRAM_FILE) == @__FILE__
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
-    N_iterations=7,
+    N_iterations=3,
     N_ensemble=100,
     # TEST RUN (7000 yr) with the observation operator, target and sigmas of
     # calibrate_do_paper.ipynb (python_operator.jl) and the wide-PPE PRIOR_BOUNDS.
