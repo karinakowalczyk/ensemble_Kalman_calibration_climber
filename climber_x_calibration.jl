@@ -81,18 +81,20 @@ const PARAM_NAMES = [
     "diff_dia_max"
 ]
 
-# Prior bounds — narrowed from the earlier ±10%-padded ranges to exclude
-# regions of parameter space that cause CLIMBER-X to diverge numerically
-# (e.g. member 57, iter 1: drag_topo_fac=3.556, slope_max=0.0021,
-# diff_dia_max=9.0e-5 all fell outside these tighter bounds, and it
-# repeatedly stalled at year 4900/5000 across two independent resubmits).
+# Prior bounds = range of the wide PPE the GPC was trained on -- identical to
+# PRIOR_BOUNDS in calibrate_do_paper.ipynb. The EKS ensemble itself is clamped to
+# this box (initial draw and after every update, see project_ensemble_to_box), so
+# CLIMBER-X always runs exactly the parameters EKS holds.
+# NOTE: checkpoints store the ensemble and prior in the [0,1]-normalised space
+# defined by these bounds -- changing them invalidates existing checkpoints, so
+# start a new output_dir after any change.
 const PRIOR_BOUNDS = Dict(
-    "diff_dia_min" => (5.0e-6,  2.0e-5),
-    "drag_topo_fac" => (2.5,    3.5),
-    "slope_max"    => (5.0e-4,  2.0e-3),
-    "diff_iso"     => (500.0,   2000.0),
-    "diff_gm"      => (500.0,   2000.0),
-    "diff_dia_max" => (1.0e-4,  2.0e-4)
+    "diff_dia_min" => (3.5e-6,  2.15e-5),
+    "drag_topo_fac" => (2.4,    3.6),
+    "slope_max"    => (3.5e-4,  2.15e-3),
+    "diff_iso"     => (350.0,   2150.0),
+    "diff_gm"      => (350.0,   2150.0),
+    "diff_dia_max" => (9.0e-5,  2.1e-4)
 )
 
 # ── GPC-derived Gaussian prior ────────────────────────────────────────────────
@@ -287,12 +289,14 @@ function build_member_params_dict(params_i_norm_col, nyears)
     params_dict = Dict{String, Any}()
 
     # params_i_norm_col is in [0,1] normalised space; denormalise to physical units for CLIMBER.
-    # No clamping to PRIOR_BOUNDS: CLIMBER-X must run exactly the parameters EKS holds,
-    # otherwise the output is attributed to a point that was never run.
+    # No clamping here: the EKS ensemble itself is already projected into the box
+    # (project_ensemble_to_box), so CLIMBER-X runs exactly the parameters EKS holds.
+    # A value outside [0,1] here would mean that projection was skipped -- a bug.
     for (idx, name) in enumerate(PARAM_NAMES)
-        θ = denormalise_param(params_i_norm_col[idx], name)
-        θ > 0 || error("Non-positive $name = $θ -- not physically valid, refusing to submit")
-        params_dict["ocn.$(name)"] = θ
+        p_norm = params_i_norm_col[idx]
+        -1e-12 <= p_norm <= 1 + 1e-12 ||
+            error("$name = $(denormalise_param(p_norm, name)) outside PRIOR_BOUNDS -- ensemble was not projected into the box")
+        params_dict["ocn.$(name)"] = denormalise_param(clamp(p_norm, 0.0, 1.0), name)
     end
 
     for (key, val) in CLIMBER_FIXED_PARAMS
@@ -304,25 +308,23 @@ function build_member_params_dict(params_i_norm_col, nyears)
 end
 
 """
-Check a whole [0,1]-normalised ensemble for non-positive physical parameters before
-any job is submitted -- build_member_params_dict would otherwise error part-way
-through a submission loop, leaving some members submitted and others not. Also
-reports how many members lie outside PRIOR_BOUNDS (allowed, just for information).
+Project the EKS ensemble into PRIOR_BOUNDS ([0,1] in normalised space), so that
+CLIMBER-X runs exactly the parameters EKS holds and every output is attributed to
+the point that was actually run. Applied to the initial draw and after every
+update. If any member is outside the box, the EKS object is rebuilt from the
+clamped ensemble -- exact, since the EKS update only uses the current ensemble
+(the same rebuild the :pca branch already does every iteration).
+Returns the (possibly rebuilt) EKS object.
 """
-function check_ensemble_physical(params_norm)
-    params_phys = denormalise_params(params_norm)
-    bad = [(name, j, params_phys[idx, j]) for (idx, name) in enumerate(PARAM_NAMES)
-           for j in axes(params_phys, 2) if params_phys[idx, j] <= 0]
-    if !isempty(bad)
-        for (name, j, θ) in bad
-            println("    member $j: $name = $θ")
-        end
-        error("$(length(bad)) non-positive parameter value(s) in the ensemble -- not submitting")
-    end
-    outside = [any(!(param_lo(name) <= params_phys[idx, j] <= param_hi(name))
-                   for (idx, name) in enumerate(PARAM_NAMES)) for j in axes(params_phys, 2)]
-    println("  Members with at least one parameter outside PRIOR_BOUNDS (run unclamped): " *
-            "$(count(outside)) / $(size(params_phys, 2))")
+function project_ensemble_to_box(eksobj, prior, y_obs, obs_noise_cov)
+    u = get_u_final(eksobj)
+    outside = [any((u[:, j] .< 0) .| (u[:, j] .> 1)) for j in axes(u, 2)]
+    n_params_clamped = count((u .< 0) .| (u .> 1))
+    println("  Members clamped into PRIOR_BOUNDS: $(count(outside)) / $(size(u, 2))" *
+            " ($n_params_clamped parameter value(s))")
+    count(outside) == 0 && return eksobj
+    return EnsembleKalmanProcess(clamp.(u, 0.0, 1.0), y_obs, obs_noise_cov,
+                                 Sampler(prior); verbose=true)
 end
 
 """
@@ -1002,12 +1004,11 @@ function run_climber_x_calibration(;
     # match the real 200-member DO-region PPE's shape for those parameters --
     # i.e. it was a construction artifact, not a reflection of the physical
     # parameter space. A plain (unbounded) Gaussian matches that real PPE
-    # closely instead. Draws outside [0,1] (~6-15% per parameter) are run as
-    # drawn -- no clamping, so every output belongs to the parameters EKS holds;
-    # genuinely bad/divergent members are expected to be caught by the real
-    # job's failure handling rather than avoided a priori by prior shape.
-    # Only physically impossible (non-positive) values stop the run, see
-    # check_ensemble_physical.
+    # closely instead. Draws outside [0,1] (~2-8% per parameter, ~24% of members
+    # with the wide-PPE bounds) are clamped to the box edge in the EKS ensemble
+    # itself (project_ensemble_to_box), so every output belongs to the parameters
+    # EKS holds; genuinely bad/divergent members are expected to be caught by the
+    # real job's failure handling rather than avoided a priori by prior shape.
     # This is one *joint* multivariate distribution (not combine_distributions
     # of independent ones), so it carries the correlations the GPC learned
     # between parameters (e.g. diff_dia_min vs diff_gm).
@@ -1033,10 +1034,11 @@ function run_climber_x_calibration(;
         println("    $(name): $(test_ensemble_phys[idx, 1:5])")
     end
     println("\n  NOTE: a Gaussian has unbounded support in normalised space -- individual")
-    println("  draws can fall outside [0,1] (i.e. outside PRIOR_BOUNDS), ~6-15% per")
-    println("  parameter. These are submitted unclamped; genuinely divergent members are")
-    println("  expected to fail as real jobs and get caught by the failure handling.")
-    println("  Non-positive (physically impossible) values stop the run before submission.")
+    println("  draws can fall outside [0,1] (i.e. outside PRIOR_BOUNDS), ~2-8% per")
+    println("  parameter. The EKS ensemble is clamped into the box (initial draw and after")
+    println("  every update), so CLIMBER-X runs exactly the parameters EKS holds; genuinely")
+    println("  divergent members are expected to fail as real jobs and get caught by the")
+    println("  failure handling.")
 
     println("\n  Sanity check -- 2000-sample empirical mean/std (physical) vs GPC target:")
     for (idx, name) in enumerate(PARAM_NAMES)
@@ -1225,18 +1227,11 @@ function run_climber_x_calibration(;
 
         println("\nInitializing EKI process...")
         initial_ensemble = construct_initial_ensemble(prior, N_ensemble)
-        # Redraw members with any non-positive physical parameter (i.e. truncate the
-        # Gaussian prior at zero, where it is physically impossible). Matters mainly for
-        # diff_dia_min (~0.26% per draw, ~23% chance per 100-member ensemble) --
-        # otherwise check_ensemble_physical would stop iteration 1 before submission.
-        n_redrawn = 0
-        while true
-            bad_members = findall(j -> any(denormalise_params(initial_ensemble[:, j:j]) .<= 0), 1:N_ensemble)
-            isempty(bad_members) && break
-            initial_ensemble[:, bad_members] = construct_initial_ensemble(prior, length(bad_members))
-            n_redrawn += length(bad_members)
-        end
-        n_redrawn > 0 && println("  Redrew $n_redrawn initial member(s) with non-positive physical parameters")
+        # Clamp the initial draw into PRIOR_BOUNDS -- same projection as after every
+        # update (project_ensemble_to_box), so the ensemble EKS holds is what runs.
+        n_clamped_init = count(j -> any((initial_ensemble[:, j] .< 0) .| (initial_ensemble[:, j] .> 1)), 1:N_ensemble)
+        initial_ensemble = clamp.(initial_ensemble, 0.0, 1.0)
+        println("  Initial members clamped into PRIOR_BOUNDS: $n_clamped_init / $N_ensemble")
         eks_process = Sampler(prior)
 
         println("\n  DEBUG: Initial ensemble after construction (physical space):")
@@ -1348,7 +1343,6 @@ function run_climber_x_calibration(;
         
         params_i_norm = get_ϕ_final(prior, eksobj)   # [0,1] normalised space
         params_i      = denormalise_params(params_i_norm)  # physical space (for jobs + saving)
-        check_ensemble_physical(params_i_norm)
 
         println("\n  DEBUG: First 3 ensemble members (physical space):")
         for j in 1:min(3, size(params_i, 2))
@@ -1547,6 +1541,9 @@ function run_climber_x_calibration(;
         # Update ensemble
         println("\n  Updating ensemble with EKI...")
         update_ensemble!(eksobj, G_for_update)
+        # Clamp the updated ensemble into PRIOR_BOUNDS before it is saved or submitted
+        # as iteration i+1, so the next outputs belong to exactly these parameters.
+        eksobj = project_ensemble_to_box(eksobj, prior, y_obs, Diagonal(uncertainties.^2))
         param_history[:, i+1, :] = denormalise_params(get_ϕ_final(prior, eksobj))
 
         # Current parameter estimates (denormalised to physical space for reporting)
@@ -1667,10 +1664,11 @@ end
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
     N_iterations=7,
     N_ensemble=100,
-    # New directory for the unclamped run -- eki_calibration_75ky/ holds the earlier
-    # clamped iteration 1, whose outputs must not be reused here.
-    output_dir="/p/tmp/karinako/eki_calibration_75ky_noclamp/output",
-    work_dir="/p/tmp/karinako/eki_calibration_75ky_noclamp/working",
+    # Fresh run with the wide-PPE PRIOR_BOUNDS and the ensemble clamped into them.
+    # eki_calibration_75ky/ holds the earlier tight-box run, whose iter_1 outputs
+    # must not be reused here (different parameters, different normalisation).
+    output_dir="/p/tmp/karinako/eki_calibration_75ky_widebox/output",
+    work_dir="/p/tmp/karinako/eki_calibration_75ky_widebox/working",
     check_interval_minutes=30,
     # max_retries_per_member=0 below means each member gets one attempt (up to
     # CLIMBER_WALLTIME=165h), no resubmit -- 20 days is generous headroom over that
