@@ -20,6 +20,7 @@ using MultivariateStats
 # Include job management and summary statistics
 include("eks_job_management.jl")
 include("climber_summary_stats.jl")
+include("python_operator.jl")   # calibration_mode=:python -- observation operator of calibrate_do_paper.ipynb
 
 # ============================================
 # CLIMBER-X CONFIGURATION
@@ -35,7 +36,8 @@ const RUNME_SCRIPT = joinpath(CLIMBER_X_DIR, "runme")
 # stated 150h requirement while staying 3h clear of that hard cap (not requesting
 # exactly the cap, to avoid any edge-case scheduler rejection right at the
 # boundary).
-const CLIMBER_WALLTIME = "165:00:00"
+# TEST RUN (nyears=7000): 20h is enough. Set back to "165:00:00" for 75000-yr runs.
+const CLIMBER_WALLTIME = "20:00:00"
 # "standby" (priority 2500) is the QOS actual preemptions were observed under --
 # `medium` (priority 5000, same 7-day walltime cap) doesn't get preempted by
 # standby-tier jobs the way standby itself does, at the cost of counting against
@@ -576,7 +578,8 @@ end
 """
 Collect results from CLIMBER-X iteration using PDF + dynamical statistics
 """
-function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02, n_threshold::Int=1, expected_nyears=nothing, pdf_tolerance)
+function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncertainties; max_failures_allowed=5, do_crossing_value=5.0, do_method="loess", loess_span=0.02, ens_spinup_fraction=0.02, n_threshold::Int=1, expected_nyears=nothing, pdf_tolerance,
+                                           process_fn=nothing)   # output_file -> [pdf...; wt; sd]; nothing = Julia summary stats
     N_ensemble = length(job_trackers)
     n_outputs = length(y_obs)  # PDF grid points + 2 dynamical stats
     G_ensemble = zeros(n_outputs, N_ensemble)
@@ -592,17 +595,21 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
             if is_valid
                 try
                     # Process output: get PDF + stats
-                    calibration_vector, stats = process_climber_output_with_stats(
-                        tracker.output_file, pdf_grid,
-                        remove_spinup=true,
-                        spinup_fraction=ens_spinup_fraction,
-                        do_min_spacing=600,
-                        do_crossing_value=do_crossing_value,
-                        do_method=do_method,
-                        loess_span=loess_span,
-                        n_threshold=n_threshold
-                    )
-                    
+                    calibration_vector = if isnothing(process_fn)
+                        process_climber_output_with_stats(
+                            tracker.output_file, pdf_grid,
+                            remove_spinup=true,
+                            spinup_fraction=ens_spinup_fraction,
+                            do_min_spacing=600,
+                            do_crossing_value=do_crossing_value,
+                            do_method=do_method,
+                            loess_span=loess_span,
+                            n_threshold=n_threshold
+                        )[1]
+                    else
+                        process_fn(tracker.output_file)
+                    end
+
                     # Physical units throughout -- observation uncertainty is carried
                     # by obs_noise_cov (passed to EnsembleKalmanProcess), not baked
                     # into the data.
@@ -643,7 +650,7 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
     valid_members = [j for j in 1:N_ensemble if all(isfinite.(G_ensemble[:, j]))]
     if !isempty(valid_members)
         n_pdf = length(pdf_grid)
-        dx = step(pdf_grid)
+        dx = pdf_grid[2] - pdf_grid[1]   # pdf_grid may be a plain Vector (checkpoint, Python grid)
 
         pdf_obs = y_obs[1:n_pdf]
         l2_distances = [l2_distance(G_ensemble[1:n_pdf, j], pdf_obs, dx) for j in valid_members]
@@ -658,7 +665,8 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
         println("    Mean: $(round(mean(l2_distances), digits=6))")
         println("    Min:  $(round(minimum(l2_distances), digits=6))")
         println("    Max:  $(round(maximum(l2_distances), digits=6))")
-        println("    Members within tolerance (< $pdf_tolerance): $(sum(l2_distances .< pdf_tolerance))/$(length(l2_distances))")
+        isfinite(pdf_tolerance) &&   # NaN in :python mode (no per-grid-point PDF sigma there)
+            println("    Members within tolerance (< $pdf_tolerance): $(sum(l2_distances .< pdf_tolerance))/$(length(l2_distances))")
 
         println("\n  Waiting time statistics (years):")
         println("    Target: $(round(waiting_time_obs, digits=1)) years")
@@ -674,12 +682,15 @@ function collect_climber_iteration_results(job_trackers, pdf_grid, y_obs, uncert
 
         # Residuals normalised by observation uncertainty (diagnostic only -- the data
         # stays in physical units; RMS ≈ 1 means ensemble spread matches the
-        # uncertainty assumed in obs_noise_cov).
+        # uncertainty assumed in obs_noise_cov). Skipped where no sigma exists in the
+        # full 102-dim basis (NaN: PDF and stadial duration in :python mode, whose
+        # sigmas live in PCA space -- see save_iteration_results for those residuals).
         resid = (G_ensemble[:, valid_members] .- y_obs) ./ uncertainties
+        rms(rows) = round(sqrt(mean(resid[rows, :].^2)), digits=3)
         println("\n  Normalised residual RMS (physical data vs. obs_noise_cov, ideally ≈ 1):")
-        println("    PDF components:    $(round(sqrt(mean(resid[1:n_pdf, :].^2)), digits=3))")
-        println("    Waiting time:      $(round(sqrt(mean(resid[n_pdf+1, :].^2)), digits=3))")
-        println("    Stadial duration:  $(round(sqrt(mean(resid[n_pdf+2, :].^2)), digits=3))")
+        all(isfinite, uncertainties[1:n_pdf]) && println("    PDF components:    $(rms(1:n_pdf))")
+        isfinite(uncertainties[n_pdf+1])      && println("    Waiting time:      $(rms(n_pdf+1))")
+        isfinite(uncertainties[n_pdf+2])      && println("    Stadial duration:  $(rms(n_pdf+2))")
     end
 
     # Impute failed members (still NaN at this point) before returning, so they
@@ -803,7 +814,7 @@ function save_iteration_results(iteration, params_i, G_ensemble, job_trackers,
 
     # Compute diagnostics for all valid members. G_ensemble/y_obs are already physical
     # units (isfinite, not isnan, to also catch Inf).
-    dx = step(pdf_grid)
+    dx = pdf_grid[2] - pdf_grid[1]   # pdf_grid may be a plain Vector (checkpoint, Python grid)
     n_pdf = length(pdf_grid)
 
     l2_distances = Float64[]
@@ -853,12 +864,13 @@ function save_iteration_results(iteration, params_i, G_ensemble, job_trackers,
     # pre-normalised the way it used to be.
     pca_residuals = nothing
     if !isnothing(G_pca) && !isnothing(y_obs_pca)
+        # Observation vector = PCA scores + waiting time (stadial duration is not in it).
         n_obs  = size(G_pca, 1)
-        n_pca  = n_obs - 2
+        n_pca  = n_obs - 1
         valid  = [j for j in 1:size(G_pca, 2) if all(isfinite.(G_pca[:, j]))]
         pca_residuals = (G_pca[:, valid] .- y_obs_pca) ./ uncertainties_pca  # (n_obs × n_valid)
 
-        labels = vcat(["PCA $k" for k in 1:n_pca], ["WaitingTime", "StadialDur"])
+        labels = vcat(["PCA $k" for k in 1:n_pca], ["WaitingTime"])
         mean_res = vec(mean(pca_residuals, dims=2))
         rms_res  = vec(sqrt.(mean(pca_residuals .^ 2, dims=2)))
 
@@ -928,6 +940,34 @@ end
 # MAIN CALIBRATION FUNCTION
 # ============================================
 
+"""
+Observations for calibration_mode=:python. y_obs/uncertainties are the notebook's
+obs_targets/obs_sigmas (5 PCA scores + waiting time). The full 102-dim default-run
+vector (Python PDF + wt + sd) is recomputed here for tracking and L2 diagnostics,
+and its projection is checked against the exported target -- this fails if the
+default run, the vendored summary_stats.py or the Python packages differ from what
+the notebook used. uncertainties_full has sigmas only where they exist in that
+basis (waiting time); PDF and stadial-duration entries are NaN.
+"""
+function python_observations(op::PythonObservationOperator)
+    isfile(DEFAULT_RUN_OUTPUT) || error("Default run output not found: $DEFAULT_RUN_OUTPUT")
+    amoc, time = read_climber_amoc(DEFAULT_RUN_OUTPUT)
+    y_obs_full, info = python_full_vector(op, amoc, time, op.default_kwargs)
+    max_z = maximum(abs.(project_full_to_obs(op, y_obs_full) .- op.targets) ./ op.sigmas)
+    max_z < 1e-6 || error("Default run $DEFAULT_RUN_OUTPUT does not reproduce the exported target " *
+                          "(max |diff| = $(max_z) sigma) -- check the file and python/check_python_operator.jl")
+    n_pdf = length(op.x_grid)
+    uncertainties_full = vcat(fill(NaN, n_pdf), op.sigmas[end], NaN)
+
+    println("\n  Target (calibrate_do_paper.ipynb, reproduced from the default run to $(round(max_z, sigdigits=2)) sigma):")
+    for (k, t, s) in zip(op.obs_keys, op.targets, op.sigmas)
+        @printf("    %-18s %12.4f ± %.4f\n", k, t, s)
+    end
+    println("    (Stadial duration: $(round(info["avg_stadial_duration"], digits=1)) yr -- tracked, not in target;" *
+            " n_do_events=$(info["n_do_events"]))")
+    return copy(op.targets), copy(op.sigmas), y_obs_full, uncertainties_full
+end
+
 function run_climber_x_calibration(;
     N_iterations=10,
     N_ensemble=50,
@@ -936,8 +976,11 @@ function run_climber_x_calibration(;
     check_interval_minutes=30,
     max_wait_days=10,
     pdf_grid_points=100,
-    calibration_mode=:pca,        # :pca  → N_PCA_COMPONENTS + 2 stats
-                                  # :pdf  → full 100-point PDF + 2 stats (102 total)
+    calibration_mode=:python,     # :python → observation operator, target and sigmas of
+                                  #           calibrate_do_paper.ipynb (python_operator.jl):
+                                  #           5 PCA scores (fixed notebook basis) + waiting time
+                                  # :pca    → Julia stats, PCA fitted on iteration 1 + waiting time
+                                  # :pdf    → Julia stats, full 100-point PDF + waiting time
     nyears=7000,                  # length of each ensemble run in years
     do_crossing_value=5.0,        # LOESS-residual threshold (Sv) for DO event detection
     do_method="loess",            # detection method: "loess" or "upward_crossing"
@@ -947,6 +990,41 @@ function run_climber_x_calibration(;
     
     # Derived spinup fraction for ensemble member runs
     ens_spinup_fraction = spinup_years > 0 ? spinup_years / Float64(nyears) : 0.02
+
+    calibration_mode in (:python, :pca, :pdf) || error("Unknown calibration_mode: $calibration_mode")
+    # :python -- every statistic comes from python/summary_stats.py with the notebook's
+    # settings; the Julia DO-detection arguments above (do_method, loess_span, ...) are
+    # then unused. process_fn maps an output file to the full [pdf...; wt; sd] vector.
+    python_op  = nothing
+    process_fn = nothing
+    pdf_tolerance = NaN   # L2 reporting aid; only defined by the Julia window analysis
+    if calibration_mode == :python
+        println("\nLoading Python observation operator...")
+        python_op = load_python_operator()
+        println("  Setup: $(python_op.setup["setup_file"])")
+        println("  Exported from $(python_op.setup["notebook"]["file"]) at $(python_op.setup["notebook"]["commit"])" *
+                (python_op.setup["notebook"]["uncommitted_changes"] ? " (+ uncommitted changes)" : ""))
+        println("  PDF grid: $(length(python_op.x_grid)) points on " *
+                "[$(round(first(python_op.x_grid), digits=2)), $(round(last(python_op.x_grid), digits=2))] Sv, " *
+                "$(n_pca(python_op)) PCA components")
+        # Ensemble members use the notebook's settings except spinup and LOESS span,
+        # which depend on the run length and come from this function's arguments
+        # (the notebook's are for 75 kyr runs; the target always uses the notebook's
+        # default-run settings, since the default run is always 75 kyr).
+        member_kwargs = copy(python_op.member_kwargs)
+        for (key, val) in (:spinup_fraction => ens_spinup_fraction, :loess_span => loess_span)
+            if !isapprox(val, member_kwargs[key])
+                println("  NOTE: members use $key=$(round(val, sigdigits=4)) (notebook: $(member_kwargs[key])) " *
+                        "for nyears=$nyears")
+            end
+            member_kwargs[key] = val
+        end
+        println("  Member stats settings: $member_kwargs")
+        process_fn = output_file -> begin
+            amoc, time = read_climber_amoc(output_file)
+            python_full_vector(python_op, amoc, time, member_kwargs)[1]
+        end
+    end
 
     println("="^80)
     println("CLIMBER-X EKI CALIBRATION - PDF + DYNAMICAL STATISTICS (NORMALIZED)")
@@ -1094,6 +1172,20 @@ function run_climber_x_calibration(;
                 y_obs_full         = get(checkpoint_data, "y_obs_full", checkpoint_data["y_obs"])
                 uncertainties_full = get(checkpoint_data, "uncertainties_full", checkpoint_data["uncertainties"])
 
+                if calibration_mode == :python
+                    # Target/sigmas always come from the current setup file, never from the
+                    # checkpoint (which may predate it or come from another mode).
+                    y_ckpt = y_obs
+                    y_obs, uncertainties, y_obs_full, uncertainties_full = python_observations(python_op)
+                    pdf_grid = copy(python_op.x_grid)
+                    if length(y_ckpt) != length(y_obs) || !isapprox(y_ckpt, y_obs; rtol=1e-10)
+                        @warn "Checkpoint target differs from the Python setup -- using the Python setup; " *
+                              "EKS object rebuilt with the new target"
+                    end
+                    eksobj = EnsembleKalmanProcess(get_u_final(eksobj), y_obs, Diagonal(uncertainties.^2),
+                                                   Sampler(prior); verbose=true)
+                end
+
                 start_iteration = latest_iter + 1
                 println("Resuming from iteration $start_iteration")
                 if !isnothing(pca_model)
@@ -1107,122 +1199,129 @@ function run_climber_x_calibration(;
     
     # If not resuming, initialize fresh
     if isnothing(eksobj)
-        # Process default run to get observations
-        println("\nProcessing default run for target observations...")
-        println("  Default run: $DEFAULT_RUN_OUTPUT")
+        if calibration_mode == :python
+            println("\nComputing target observations (Python operator)...")
+            y_obs, uncertainties, y_obs_full, uncertainties_full = python_observations(python_op)
+            pdf_grid = copy(python_op.x_grid)
+            obs_noise_cov = Diagonal(uncertainties.^2)
+        else
+            # Process default run to get observations
+            println("\nProcessing default run for target observations...")
+            println("  Default run: $DEFAULT_RUN_OUTPUT")
         
-        if !isfile(DEFAULT_RUN_OUTPUT)
-            error("Default run output not found: $DEFAULT_RUN_OUTPUT")
-        end
+            if !isfile(DEFAULT_RUN_OUTPUT)
+                error("Default run output not found: $DEFAULT_RUN_OUTPUT")
+            end
         
-        # Read default run
-        amoc_default, time_default = read_climber_amoc(DEFAULT_RUN_OUTPUT)
+            # Read default run
+            amoc_default, time_default = read_climber_amoc(DEFAULT_RUN_OUTPUT)
         
-        # Remove spinup
-        start_idx = Int(floor(length(amoc_default) * 0.02)) + 1
-        amoc_default = amoc_default[start_idx:end]
-        time_default = time_default[start_idx:end]
+            # Remove spinup
+            start_idx = Int(floor(length(amoc_default) * 0.02)) + 1
+            amoc_default = amoc_default[start_idx:end]
+            time_default = time_default[start_idx:end]
         
-        # Fixed AMOC grid (matches compute_summary_stats, enabling consistent PCA comparison).
-        # Upper bound 35 (not 30): real PPE data has ~0.2-0.6% of timepoints above 30 Sv but
-        # only ~0.02% above 35 (default run itself peaks at 33.5 Sv) -- see climber_summary_stats.jl.
-        pdf_grid = range(0.0, 35.0, length=pdf_grid_points)
+            # Fixed AMOC grid (matches compute_summary_stats, enabling consistent PCA comparison).
+            # Upper bound 35 (not 30): real PPE data has ~0.2-0.6% of timepoints above 30 Sv but
+            # only ~0.02% above 35 (default run itself peaks at 33.5 Sv) -- see climber_summary_stats.jl.
+            pdf_grid = range(0.0, 35.0, length=pdf_grid_points)
         
-        # Compute default PDF on this grid
-        pdf_obs = compute_pdf_on_grid(amoc_default, pdf_grid, remove_spinup=false)
+            # Compute default PDF on this grid
+            pdf_obs = compute_pdf_on_grid(amoc_default, pdf_grid, remove_spinup=false)
         
-        # Compute dynamical statistics from default run
-        # Default run always uses the original LOESS + peak-walkback detection
-        # (do_method="loess", crossing_value=5.0) regardless of ensemble settings.
-        # do_min_spacing=600 to match every ensemble-member call site below (was 500 --
-        # comparing the calibration target against predictions computed with different
-        # DO-detection settings; 600 also matches DO_MIN_SPACING in the emulator approach).
-        # loess_span=DEFAULT_RUN_LOESS_SPAN (NOT the ensemble's loess_span): the default
-        # run is always 75000 years regardless of this run's nyears, so its LOESS window
-        # must be scaled to its own fixed length to stay ~1500yr absolute -- reusing the
-        # ensemble's loess_span here previously gave e.g. an ~18000yr window for a
-        # nyears=7000 run (loess_span=0.25), over 10x too wide, silently miscalibrating
-        # every run's waiting-time target against its predictions.
-        stats_default = compute_summary_stats(amoc_default;
-                                             time_data=time_default,
-                                             remove_spinup=false,
-                                             spinup_fraction=0.0,
-                                             adaptive_threshold=true,
-                                             threshold_method="clustering",
-                                             loess_span=DEFAULT_RUN_LOESS_SPAN,
-                                             do_min_spacing=600,
-                                             do_crossing_value=do_crossing_value,
-                                             do_method=do_method,
-                                             n_threshold=n_threshold)
+            # Compute dynamical statistics from default run
+            # Default run always uses the original LOESS + peak-walkback detection
+            # (do_method="loess", crossing_value=5.0) regardless of ensemble settings.
+            # do_min_spacing=600 to match every ensemble-member call site below (was 500 --
+            # comparing the calibration target against predictions computed with different
+            # DO-detection settings; 600 also matches DO_MIN_SPACING in the emulator approach).
+            # loess_span=DEFAULT_RUN_LOESS_SPAN (NOT the ensemble's loess_span): the default
+            # run is always 75000 years regardless of this run's nyears, so its LOESS window
+            # must be scaled to its own fixed length to stay ~1500yr absolute -- reusing the
+            # ensemble's loess_span here previously gave e.g. an ~18000yr window for a
+            # nyears=7000 run (loess_span=0.25), over 10x too wide, silently miscalibrating
+            # every run's waiting-time target against its predictions.
+            stats_default = compute_summary_stats(amoc_default;
+                                                 time_data=time_default,
+                                                 remove_spinup=false,
+                                                 spinup_fraction=0.0,
+                                                 adaptive_threshold=true,
+                                                 threshold_method="clustering",
+                                                 loess_span=DEFAULT_RUN_LOESS_SPAN,
+                                                 do_min_spacing=600,
+                                                 do_crossing_value=do_crossing_value,
+                                                 do_method=do_method,
+                                                 n_threshold=n_threshold)
         
-        # Create raw observation vector
-        y_obs_raw = vcat(
-            pdf_obs,                                    # 100 values
-            stats_default["avg_waiting_time"],          # 1 value
-            stats_default["avg_stadial_duration"]       # 1 value
-        )
+            # Create raw observation vector
+            y_obs_raw = vcat(
+                pdf_obs,                                    # 100 values
+                stats_default["avg_waiting_time"],          # 1 value
+                stats_default["avg_stadial_duration"]       # 1 value
+            )
         
-        dx = step(pdf_grid)
+            dx = pdf_grid[2] - pdf_grid[1]   # pdf_grid may be a plain Vector (checkpoint, Python grid)
 
-        println("  PDF grid: $(length(pdf_grid)) points from $(round(first(pdf_grid), digits=2)) to $(round(last(pdf_grid), digits=2))")
-        println("  Grid spacing (dx): $(round(dx, digits=4))")
-        println("\n  Target observations (physical units):")
-        println("    PDF max: $(round(maximum(pdf_obs), digits=4))")
-        println("    PDF integral: $(round(sum((pdf_obs[1:end-1] .+ pdf_obs[2:end]) .* diff(pdf_grid))/2, digits=4))")
-        println("    Avg waiting time: $(round(stats_default["avg_waiting_time"], digits=1)) years")
-        println("    Avg stadial duration: $(round(stats_default["avg_stadial_duration"], digits=1)) years")
-        println("    N DO events: $(stats_default["n_do_events"])")
-        println("    N stadials: $(stats_default["n_stadials"])")
+            println("  PDF grid: $(length(pdf_grid)) points from $(round(first(pdf_grid), digits=2)) to $(round(last(pdf_grid), digits=2))")
+            println("  Grid spacing (dx): $(round(dx, digits=4))")
+            println("\n  Target observations (physical units):")
+            println("    PDF max: $(round(maximum(pdf_obs), digits=4))")
+            println("    PDF integral: $(round(sum((pdf_obs[1:end-1] .+ pdf_obs[2:end]) .* diff(pdf_grid))/2, digits=4))")
+            println("    Avg waiting time: $(round(stats_default["avg_waiting_time"], digits=1)) years")
+            println("    Avg stadial duration: $(round(stats_default["avg_stadial_duration"], digits=1)) years")
+            println("    N DO events: $(stats_default["n_do_events"])")
+            println("    N stadials: $(stats_default["n_stadials"])")
 
-        # Estimate uncertainties from overlapping windows of the default run --
-        # same strategy as calibrate_do_paper.ipynb's window analysis.
-        println("\nEstimating observation uncertainties from default run windows...")
-        block_analysis = estimate_block_uncertainties(
-            DEFAULT_RUN_OUTPUT, pdf_grid;
-            window_size=WINDOW_UNCERTAINTY_SIZE, stride_size=WINDOW_UNCERTAINTY_STRIDE, min_do_events=2,
-            do_min_spacing=600, do_crossing_value=do_crossing_value,
-            do_method=do_method, loess_span=WINDOW_UNCERTAINTY_LOESS_SPAN,
-            n_threshold=n_threshold,
-            save_dir=output_dir
-        )
+            # Estimate uncertainties from overlapping windows of the default run --
+            # same strategy as calibrate_do_paper.ipynb's window analysis.
+            println("\nEstimating observation uncertainties from default run windows...")
+            block_analysis = estimate_block_uncertainties(
+                DEFAULT_RUN_OUTPUT, pdf_grid;
+                window_size=WINDOW_UNCERTAINTY_SIZE, stride_size=WINDOW_UNCERTAINTY_STRIDE, min_do_events=2,
+                do_min_spacing=600, do_crossing_value=do_crossing_value,
+                do_method=do_method, loess_span=WINDOW_UNCERTAINTY_LOESS_SPAN,
+                n_threshold=n_threshold,
+                save_dir=output_dir
+            )
 
-        pdf_tolerance = compute_pdf_tolerance(block_analysis, pdf_grid)
-        println("  PDF tolerance (from block-to-block variability): $(round(pdf_tolerance, digits=4))")
+            pdf_tolerance = compute_pdf_tolerance(block_analysis, pdf_grid)
+            println("  PDF tolerance (from block-to-block variability): $(round(pdf_tolerance, digits=4))")
 
-        # Uncertainty vector: per-grid-point PDF std + scalar stat stds
-        uncertainties = vcat(
-            block_analysis["pdf_uncertainty"],
-            block_analysis["wt_uncertainty"],
-            block_analysis["sd_uncertainty"]
-        )
+            # Uncertainty vector: per-grid-point PDF std + scalar stat stds
+            uncertainties = vcat(
+                block_analysis["pdf_uncertainty"],
+                block_analysis["wt_uncertainty"],
+                block_analysis["sd_uncertainty"]
+            )
 
-        # Physical units throughout -- no data normalisation. Observation uncertainty
-        # is carried entirely by obs_noise_cov (Γ), matching how the emulator+MCMC
-        # approach's Gaussian likelihood works directly in physical units rather than
-        # pre-whitening the data (see gp_emulator.py: its StandardScaler is inverted
-        # before predictions ever reach the likelihood -- physical units all the way
-        # through the actual statistical step, which is what this now mirrors).
-        # Keep 102-dim copies — needed for PCA fitting, G projection, and stadial-duration
-        # tracking regardless of calibration mode.
-        y_obs_full         = y_obs_raw
-        uncertainties_full = uncertainties
+            # Physical units throughout -- no data normalisation. Observation uncertainty
+            # is carried entirely by obs_noise_cov (Γ), matching how the emulator+MCMC
+            # approach's Gaussian likelihood works directly in physical units rather than
+            # pre-whitening the data (see gp_emulator.py: its StandardScaler is inverted
+            # before predictions ever reach the likelihood -- physical units all the way
+            # through the actual statistical step, which is what this now mirrors).
+            # Keep 102-dim copies — needed for PCA fitting, G projection, and stadial-duration
+            # tracking regardless of calibration mode.
+            y_obs_full         = y_obs_raw
+            uncertainties_full = uncertainties
 
-        # Calibration target excludes stadial_duration (last element) -- PDF + waiting_time
-        # only. Stadial duration is still computed and tracked throughout (in G_ensemble,
-        # results files, and the final-performance report), just not part of what EKS is
-        # actually calibrated against.
-        y_obs         = y_obs_full[1:end-1]
-        uncertainties = uncertainties_full[1:end-1]
+            # Calibration target excludes stadial_duration (last element) -- PDF + waiting_time
+            # only. Stadial duration is still computed and tracked throughout (in G_ensemble,
+            # results files, and the final-performance report), just not part of what EKS is
+            # actually calibrated against.
+            y_obs         = y_obs_full[1:end-1]
+            uncertainties = uncertainties_full[1:end-1]
 
-        obs_noise_cov = Diagonal(uncertainties.^2)
+            obs_noise_cov = Diagonal(uncertainties.^2)
 
-        println("\n  Using real observation covariance (physical units, diag(uncertainties.^2))")
-        let n_pdf = length(pdf_grid)
-            println("  Observation uncertainties in use (calibration target -- PDF + waiting_time only):")
-            println("    PDF: mean per-grid-point σ=$(round(mean(uncertainties[1:n_pdf]), digits=6))," *
-                    " max σ=$(round(maximum(uncertainties[1:n_pdf]), digits=6))")
-            println("    Waiting time σ:     $(round(uncertainties[n_pdf+1], digits=1)) years")
-            println("    (Stadial duration σ: $(round(uncertainties_full[n_pdf+2], digits=1)) years -- tracked, not in target)")
+            println("\n  Using real observation covariance (physical units, diag(uncertainties.^2))")
+            let n_pdf = length(pdf_grid)
+                println("  Observation uncertainties in use (calibration target -- PDF + waiting_time only):")
+                println("    PDF: mean per-grid-point σ=$(round(mean(uncertainties[1:n_pdf]), digits=6))," *
+                        " max σ=$(round(maximum(uncertainties[1:n_pdf]), digits=6))")
+                println("    Waiting time σ:     $(round(uncertainties[n_pdf+1], digits=1)) years")
+                println("    (Stadial duration σ: $(round(uncertainties_full[n_pdf+2], digits=1)) years -- tracked, not in target)")
+            end
         end
 
         println("\nInitializing EKI process...")
@@ -1292,7 +1391,8 @@ function run_climber_x_calibration(;
     end
 
     # On resume, block_analysis was not computed inside the checkpoint branch — do it now.
-    if isnothing(block_analysis)
+    # (Not used in :python mode -- its sigmas come from the notebook's window analysis.)
+    if isnothing(block_analysis) && calibration_mode != :python
         println("\nEstimating observation uncertainties from default run windows (resumed run)...")
         block_analysis = estimate_block_uncertainties(
             DEFAULT_RUN_OUTPUT, pdf_grid;
@@ -1307,15 +1407,19 @@ function run_climber_x_calibration(;
     end
 
     obs_noise_cov = Diagonal(uncertainties.^2)
-    let n_pdf = length(pdf_grid)
-        # uncertainties itself may already be PCA-reduced here (:pca mode, resumed
-        # past iteration 1) -- uncertainties_full is always the full 102-dim vector.
-        println("\n  Observation uncertainties (resumed, full 102-dim basis -- tracking only,")
-        println("  actual calibration target may be a reduced slice of this, see uncertainties):")
-        println("    PDF: mean per-grid-point σ=$(round(mean(uncertainties_full[1:n_pdf]), digits=6))," *
-                " max σ=$(round(maximum(uncertainties_full[1:n_pdf]), digits=6))")
-        println("    Waiting time σ:     $(round(uncertainties_full[n_pdf+1], digits=1)) years")
-        println("    (Stadial duration σ: $(round(uncertainties_full[n_pdf+2], digits=1)) years -- tracked, not in target)")
+    if calibration_mode == :python
+        println("\n  Observation uncertainties in use (notebook obs_sigmas): $(round.(uncertainties, sigdigits=4))")
+    else
+        let n_pdf = length(pdf_grid)
+            # uncertainties itself may already be PCA-reduced here (:pca mode, resumed
+            # past iteration 1) -- uncertainties_full is always the full 102-dim vector.
+            println("\n  Observation uncertainties (resumed, full 102-dim basis -- tracking only,")
+            println("  actual calibration target may be a reduced slice of this, see uncertainties):")
+            println("    PDF: mean per-grid-point σ=$(round(mean(uncertainties_full[1:n_pdf]), digits=6))," *
+                    " max σ=$(round(maximum(uncertainties_full[1:n_pdf]), digits=6))")
+            println("    Waiting time σ:     $(round(uncertainties_full[n_pdf+1], digits=1)) years")
+            println("    (Stadial duration σ: $(round(uncertainties_full[n_pdf+2], digits=1)) years -- tracked, not in target)")
+        end
     end
 
     metadata = Dict(
@@ -1323,6 +1427,9 @@ function run_climber_x_calibration(;
         "N_iterations" => N_iterations,
         "N_ensemble" => N_ensemble,
         "param_names" => PARAM_NAMES,
+        "calibration_mode" => calibration_mode,
+        "python_setup" => isnothing(python_op) ? nothing : python_op.setup,
+        "obs_keys" => isnothing(python_op) ? nothing : python_op.obs_keys,
         "pdf_grid_points" => pdf_grid_points,
         "pdf_tolerance" => pdf_tolerance,
         "waiting_time_uncertainty" => WAITING_TIME_UNCERTAINTY,
@@ -1469,10 +1576,16 @@ function run_climber_x_calibration(;
                                                        ens_spinup_fraction=ens_spinup_fraction,
                                                        n_threshold=n_threshold,
                                                        expected_nyears=nyears,
-                                                       pdf_tolerance=pdf_tolerance)
+                                                       pdf_tolerance=pdf_tolerance,
+                                                       process_fn=process_fn)
 
+        # ── Python mode: project onto the notebook's fixed PCA basis ────────
+        # G_ensemble is [python PDF...; wt; sd] per member (failed members already
+        # imputed); the EKS observation is [5 PCA scores; wt], same as the MCMC's.
+        if calibration_mode == :python
+            G_for_update = project_full_to_obs(python_op, G_ensemble)
         # ── PCA mode: refit PCA on current ensemble, then project ───────────
-        if calibration_mode == :pca
+        elseif calibration_mode == :pca
             n_pdf   = length(pdf_grid)
             valid_j = [j for j in 1:size(G_ensemble, 2)
                        if all(isfinite.(G_ensemble[:, j]))]
@@ -1563,9 +1676,9 @@ function run_climber_x_calibration(;
         # Save results — always pass full 102-dim G and uncertainties for analysis
         save_iteration_results(i, params_i, G_ensemble, job_trackers,
                              current_mean, current_std, y_obs_full, pdf_grid, uncertainties_full, output_dir;
-                             pca_model=pca_model, G_pca=(calibration_mode == :pca ? G_for_update : nothing),
-                             y_obs_pca=(calibration_mode == :pca ? y_obs : nothing),
-                             uncertainties_pca=(calibration_mode == :pca ? uncertainties : nothing),
+                             pca_model=pca_model, G_pca=(calibration_mode in (:pca, :python) ? G_for_update : nothing),
+                             y_obs_pca=(calibration_mode in (:pca, :python) ? y_obs : nothing),
+                             uncertainties_pca=(calibration_mode in (:pca, :python) ? uncertainties : nothing),
                              iter_start_time=iter_start_time)
 
         save_checkpoint(i, eksobj, prior, param_history,
@@ -1609,16 +1722,20 @@ function run_climber_x_calibration(;
         output_file = joinpath(output_dir, "iter_$(N_iterations)", "member_$(j)", "ocn_ts.nc")
         if isfile(output_file) && validate_climber_output_file(output_file; expected_nyears=nyears)[1]
             try
-                calibration_vector, _ = process_climber_output_with_stats(
-                    output_file, pdf_grid,
-                    remove_spinup=true,
-                    spinup_fraction=ens_spinup_fraction,
-                    do_min_spacing=600,
-                    do_crossing_value=do_crossing_value,
-                    do_method=do_method,
-                    loess_span=loess_span,
-                    n_threshold=n_threshold
-                )
+                calibration_vector = if isnothing(process_fn)
+                    process_climber_output_with_stats(
+                        output_file, pdf_grid,
+                        remove_spinup=true,
+                        spinup_fraction=ens_spinup_fraction,
+                        do_min_spacing=600,
+                        do_crossing_value=do_crossing_value,
+                        do_method=do_method,
+                        loess_span=loess_span,
+                        n_threshold=n_threshold
+                    )[1]
+                else
+                    process_fn(output_file)
+                end
                 push!(valid_members, j)
                 push!(final_pdfs, calibration_vector[1:n_pdf])
                 push!(final_waiting_times, calibration_vector[n_pdf+1])
@@ -1630,7 +1747,7 @@ function run_climber_x_calibration(;
     end
     
     if !isempty(final_pdfs)
-        dx = step(pdf_grid)
+        dx = pdf_grid[2] - pdf_grid[1]   # pdf_grid may be a plain Vector (checkpoint, Python grid)
         pdf_obs = y_obs_full[1:n_pdf]  # already physical units
 
         l2_distances = [l2_distance(pdf, pdf_obs, dx) for pdf in final_pdfs]
@@ -1639,7 +1756,8 @@ function run_climber_x_calibration(;
         println("  L2 distance - Mean: $(round(mean(l2_distances), digits=6))")
         println("  L2 distance - Min:  $(round(minimum(l2_distances), digits=6))")
         println("  L2 distance - Max:  $(round(maximum(l2_distances), digits=6))")
-        println("  Members within tolerance (< $pdf_tolerance): $(sum(l2_distances .< pdf_tolerance))/$(length(l2_distances))")
+        isfinite(pdf_tolerance) &&
+            println("  Members within tolerance (< $pdf_tolerance): $(sum(l2_distances .< pdf_tolerance))/$(length(l2_distances))")
 
         println("\nFinal waiting time performance:")
         println("  Target: $(round(y_obs_full[n_pdf+1], digits=1)) years")
@@ -1661,28 +1779,34 @@ end
 # RUN THE CALIBRATION
 # ============================================
 
+# Only when run as a script (`julia climber_x_calibration.jl`), so the file can be
+# include()d by tests without starting a calibration.
+if abspath(PROGRAM_FILE) == @__FILE__
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
     N_iterations=7,
     N_ensemble=100,
-    # Fresh run with the wide-PPE PRIOR_BOUNDS and the ensemble clamped into them.
-    # eki_calibration_75ky/ holds the earlier tight-box run, whose iter_1 outputs
-    # must not be reused here (different parameters, different normalisation).
-    output_dir="/p/tmp/karinako/eki_calibration_75ky_widebox/output",
-    work_dir="/p/tmp/karinako/eki_calibration_75ky_widebox/working",
+    # TEST RUN (7000 yr) with the observation operator, target and sigmas of
+    # calibrate_do_paper.ipynb (python_operator.jl) and the wide-PPE PRIOR_BOUNDS.
+    # For the production run: nyears=75000, spinup_years=1500, loess_span=0.02
+    # (= the notebook's member settings) and a new output directory.
+    calibration_mode=:python,
+    output_dir="/p/tmp/karinako/eki_calibration_test_python/output",
+    work_dir="/p/tmp/karinako/eki_calibration_test_python/working",
     check_interval_minutes=30,
     # max_retries_per_member=0 below means each member gets one attempt (up to
     # CLIMBER_WALLTIME=165h), no resubmit -- 20 days is generous headroom over that
     # for standby-QOS queue wait before a job even starts running, not for a retry.
     max_wait_days=20,
     pdf_grid_points=100,
-    nyears=75000,
+    nyears=7000,
     do_crossing_value=5.0,
     do_method="loess",
-    loess_span=0.02, # 0.25,
-    spinup_years=1500, # 1500
+    loess_span=0.25,       # 0.25 * 6000 yr analysed ≈ 1500 yr background (0.02 for 75 kyr runs)
+    spinup_years=1000,
     n_threshold=2          # min n_do_events required for do_variability=true.
                            # 1 event gives no measurable waiting time (needs >=2 to get
                            # a gap between onsets), so avg_waiting_time=0.0 would mean
                            # both "no DO activity" and "exactly 1 event" -- same sentinel,
                            # ambiguous. >=2 events required before do_variability=true.
 )
+end
