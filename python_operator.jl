@@ -10,7 +10,26 @@
 # Python, so Python never loads its own netCDF/HDF5 libraries into this process.
 # Julia and xarray read identical Float64 arrays from CLIMBER-X ocn_ts.nc files.
 
+# Loading PythonCall with its CondaPkg-managed Python calls CondaPkg.activate!(ENV),
+# which puts the private conda env first on PATH (plus CONDA_PREFIX etc.) for the
+# whole Julia process. Every external command the driver starts would then see that
+# Python -- including `./runme` (a Python script needing the `runner` module) and
+# the jobs it submits. So: snapshot ENV, load PythonCall, import the compiled
+# modules summary_stats.py needs while the conda env is still active (PythonCall
+# activates it for loading extension modules), then restore ENV exactly. The
+# embedded interpreter is initialised by then and unaffected.
+const ENV_BEFORE_PYTHONCALL = copy(ENV)
 using PythonCall
+for mod in ("numpy", "scipy.stats", "scipy.signal", "scipy.ndimage", "sklearn.cluster",
+            "sklearn.decomposition", "pandas", "xarray", "matplotlib.pyplot")
+    pyimport(mod)
+end
+for k in collect(keys(ENV))
+    haskey(ENV_BEFORE_PYTHONCALL, k) || delete!(ENV, k)
+end
+for (k, v) in ENV_BEFORE_PYTHONCALL
+    ENV[k] = v
+end
 
 const PYTHON_DIR = joinpath(@__DIR__, "python")
 const PYTHON_SETUP_FILE = joinpath(@__DIR__, "data", "python_calibration_setup.json")
