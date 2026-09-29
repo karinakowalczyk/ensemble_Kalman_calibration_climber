@@ -1044,7 +1044,10 @@ function run_climber_x_calibration(;
                      for f in existing_checkpoints]
         latest_iter = maximum(iter_nums)
         
-        if latest_iter > 0
+        # >= 0: checkpoint_iter_0 must also be offered for resume -- otherwise a fresh
+        # random initial ensemble is drawn and paired with any iter_1 outputs that
+        # already exist from the original draw.
+        if latest_iter >= 0
             println("\n  Found checkpoint at iteration $latest_iter")
             print("  Resume from checkpoint? (y/n): ")
             response = readline()
