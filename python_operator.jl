@@ -101,7 +101,10 @@ function python_full_vector(op::PythonObservationOperator, amoc, time, kwargs)
         "avg_waiting_time"     => wt,
         "avg_stadial_duration" => sd,
         "n_do_events"          => pyconvert(Int, stats["n_do_events"]),
-        "do_variability"       => pyconvert(Bool, stats["do_variability"]),
+        # pytruth, not pyconvert(Bool, ...): for runs without DO variability
+        # summary_stats.py returns a numpy.bool_ (`(fp_loc <= thr) and (...)` yields its
+        # first, numpy, operand), which pyconvert refuses to turn into a Julia Bool.
+        "do_variability"       => pytruth(stats["do_variability"]),
     )
     return vcat(pdf, wt, sd), info
 end
