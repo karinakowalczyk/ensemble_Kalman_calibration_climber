@@ -36,8 +36,8 @@ const RUNME_SCRIPT = joinpath(CLIMBER_X_DIR, "runme")
 # stated 150h requirement while staying 3h clear of that hard cap (not requesting
 # exactly the cap, to avoid any edge-case scheduler rejection right at the
 # boundary).
-# TEST RUN (nyears=7000): 20h is enough. Set back to "165:00:00" for 75000-yr runs.
-const CLIMBER_WALLTIME = "20:00:00"
+# 75000-yr runs (~150h). For 7000-yr test runs, "20:00:00" is enough.
+const CLIMBER_WALLTIME = "165:00:00"
 # "standby" (priority 2500) is the QOS actual preemptions were observed under --
 # `medium` (priority 5000, same 7-day walltime cap) doesn't get preempted by
 # standby-tier jobs the way standby itself does, at the cost of counting against
@@ -941,6 +941,27 @@ end
 # ============================================
 
 """
+The EKS prior: the GPC-derived Gaussian (GPC_PRIOR_MEAN_PHYS/GPC_PRIOR_COV_PHYS),
+affine-mapped into the [0,1]-normalised space defined by PRIOR_BOUNDS, with
+no_constraint() (see the comment at its use in run_climber_x_calibration).
+"""
+function build_gpc_prior()
+    μ_phys = [GPC_PRIOR_MEAN_PHYS[name] for name in PARAM_NAMES]
+    lo_vec = [param_lo(name) for name in PARAM_NAMES]
+    hi_vec = [param_hi(name) for name in PARAM_NAMES]
+    D = Diagonal(1.0 ./ (hi_vec .- lo_vec))
+
+    μ_prior_norm = D * (μ_phys .- lo_vec)
+    Σ_prior_norm = Symmetric(D * GPC_PRIOR_COV_PHYS * D)
+
+    return ParameterDistribution(
+        Parameterized(MvNormal(μ_prior_norm, Σ_prior_norm)),
+        repeat([no_constraint()], length(PARAM_NAMES)),
+        "ocean_params",
+    )
+end
+
+"""
 Observations for calibration_mode=:python. y_obs/uncertainties are the notebook's
 obs_targets/obs_sigmas (5 PCA scores + waiting time). The full 102-dim default-run
 vector (Python PDF + wt + sd) is recomputed here for tracking and L2 diagnostics,
@@ -1090,19 +1111,7 @@ function run_climber_x_calibration(;
     # This is one *joint* multivariate distribution (not combine_distributions
     # of independent ones), so it carries the correlations the GPC learned
     # between parameters (e.g. diff_dia_min vs diff_gm).
-    μ_phys = [GPC_PRIOR_MEAN_PHYS[name] for name in PARAM_NAMES]
-    lo_vec = [param_lo(name) for name in PARAM_NAMES]
-    hi_vec = [param_hi(name) for name in PARAM_NAMES]
-    D = Diagonal(1.0 ./ (hi_vec .- lo_vec))
-
-    μ_prior_norm = D * (μ_phys .- lo_vec)
-    Σ_prior_norm = Symmetric(D * GPC_PRIOR_COV_PHYS * D)
-
-    prior = ParameterDistribution(
-        Parameterized(MvNormal(μ_prior_norm, Σ_prior_norm)),
-        repeat([no_constraint()], length(PARAM_NAMES)),
-        "ocean_params",
-    )
+    prior = build_gpc_prior()
 
     # Add diagnostic
     println("\n  Verifying prior samples (physical space):")
@@ -1783,26 +1792,30 @@ end
 # include()d by tests without starting a calibration.
 if abspath(PROGRAM_FILE) == @__FILE__
 eksobj, param_history, metadata, pdf_grid, uncertainties = run_climber_x_calibration(
-    N_iterations=3,
+    # 10 iterations: in eks_emulator_test.ipynb (emulator as forward model, realistic
+    # noise) the ensemble was closest to the reference posterior after ~10-15
+    # iterations with this EKSStableScheduler setting; 7 already gets most of the way.
+    N_iterations=10,
     N_ensemble=100,
-    # TEST RUN (7000 yr) with the observation operator, target and sigmas of
+    # PRODUCTION RUN (75 kyr) with the observation operator, target and sigmas of
     # calibrate_do_paper.ipynb (python_operator.jl) and the wide-PPE PRIOR_BOUNDS.
-    # For the production run: nyears=75000, spinup_years=1500, loess_span=0.02
-    # (= the notebook's member settings) and a new output directory.
+    # Member settings = the notebook's (spinup 2% = 1500 yr, loess_span 0.02).
+    # For a 7000-yr test run: nyears=7000, spinup_years=1000, loess_span=0.25,
+    # CLIMBER_WALLTIME="20:00:00" and a test output directory.
     calibration_mode=:python,
-    output_dir="/p/tmp/karinako/eki_calibration_test_python/output",
-    work_dir="/p/tmp/karinako/eki_calibration_test_python/working",
+    output_dir="/p/tmp/karinako/eki_calibration_75ky_python/output",
+    work_dir="/p/tmp/karinako/eki_calibration_75ky_python/working",
     check_interval_minutes=30,
     # max_retries_per_member=0 below means each member gets one attempt (up to
     # CLIMBER_WALLTIME=165h), no resubmit -- 20 days is generous headroom over that
     # for standby-QOS queue wait before a job even starts running, not for a retry.
     max_wait_days=20,
     pdf_grid_points=100,
-    nyears=7000,
+    nyears=75000,
     do_crossing_value=5.0,
     do_method="loess",
-    loess_span=0.25,       # 0.25 * 6000 yr analysed ≈ 1500 yr background (0.02 for 75 kyr runs)
-    spinup_years=1000,
+    loess_span=0.02,       # 0.02 * 73500 yr analysed ≈ 1500 yr background (0.25 for 7000-yr runs)
+    spinup_years=1500,
     n_threshold=2          # min n_do_events required for do_variability=true.
                            # 1 event gives no measurable waiting time (needs >=2 to get
                            # a gap between onsets), so avg_waiting_time=0.0 would mean

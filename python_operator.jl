@@ -72,8 +72,10 @@ function load_python_operator(setup_file=PYTHON_SETUP_FILE)
         pykwargs(s["default_stats_kwargs"]),
         Dict{String, Any}(
             "setup_file" => setup_file,
-            "notebook"   => pyconvert(Any, s["notebook"]),
-            "summary_stats_py" => pyconvert(Any, s["summary_stats_py"]),
+            # Dict{String,Any}, not Any: pyconvert(Any, dict) keeps a PyDict wrapper,
+            # which JLD2 saves but can't read back without Python.
+            "notebook"   => pyconvert(Dict{String, Any}, s["notebook"]),
+            "summary_stats_py" => pyconvert(Dict{String, Any}, s["summary_stats_py"]),
             "exported"   => pyconvert(String, s["exported"]),
         ),
     )
